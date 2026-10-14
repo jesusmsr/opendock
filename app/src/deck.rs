@@ -5,6 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,6 +34,10 @@ struct State {
     /// What each key id currently shows: hash of the uploaded JPEG, None if cleared.
     shown: HashMap<u8, Option<u64>>,
     live: Live,
+    /// Signalled by action threads when they finish, so keys whose look
+    /// depends on system state (e.g. the default audio device) update at once.
+    done_tx: Sender<()>,
+    done_rx: Receiver<()>,
 }
 
 /// System state that changes what keys look like.
@@ -81,6 +86,7 @@ fn base_dir(path: &Path) -> PathBuf {
 impl State {
     fn new(path: &Path, cfg: Config) -> Self {
         let renderer = Renderer::new(cfg.font.as_deref(), &base_dir(path));
+        let (done_tx, done_rx) = channel();
         State {
             path: path.to_path_buf(),
             stack: vec![cfg.home.clone()],
@@ -89,6 +95,8 @@ impl State {
             cfg,
             shown: HashMap::new(),
             live: Live::default(),
+            done_tx,
+            done_rx,
         }
     }
 
@@ -208,10 +216,12 @@ fn on_press(st: &mut State, id: u8) -> bool {
         return false;
     };
     let navs = actions::navigation(&action);
+    let done = st.done_tx.clone();
     thread::spawn(move || {
         if let Err(e) = actions::execute(&action) {
             log(&format!("key {},{}: {e}", row + 1, col + 1));
         }
+        let _ = done.send(());
     });
     let before = st.page().to_string();
     for n in &navs {
@@ -235,12 +245,15 @@ fn session(dev: &Device, st: &mut State, lock: &EngineLock) -> ajazz_hid::Result
             dev.clear_all()?;
             return dev.flush();
         }
-        if let Some(report) = dev.read(Duration::from_millis(100))? {
+        if let Some(report) = dev.read(Duration::from_millis(50))? {
             if let Some((id, 1)) = report.key {
                 if on_press(st, id) {
                     draw_page(dev, st)?;
                 }
             }
+        }
+        if st.done_rx.try_iter().count() > 0 {
+            draw_page(dev, st)?;
         }
         if last_check.elapsed() >= POLL {
             last_check = Instant::now();

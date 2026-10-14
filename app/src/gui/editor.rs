@@ -2,7 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, Color32, ComboBox, Id, RichText, Ui};
+use eframe::egui::{
+    self, Color32, ColorImage, ComboBox, Id, Rect, RichText, Sense, Stroke, StrokeKind,
+    TextureHandle, TextureOptions, Ui, Vec2,
+};
 
 use crate::audio::{self, Endpoint};
 use crate::config::{Action, Align, AudioTarget, Key, Media, Run};
@@ -109,7 +112,6 @@ fn new_action(k: Kind, ctx: &EditorCtx) -> Action {
 pub fn key_ui(ui: &mut Ui, key: &mut Key, ctx: &EditorCtx) -> Requests {
     let mut req = Requests::default();
     ui.horizontal(|ui| {
-        ui.heading(format!("Key {}", key.pos));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .button("🗑 Clear")
@@ -140,21 +142,26 @@ pub fn key_ui(ui: &mut Ui, key: &mut Key, ctx: &EditorCtx) -> Requests {
 }
 
 fn appearance_ui(ui: &mut Ui, key: &mut Key, ctx: &EditorCtx, req: &mut Requests) {
+    // Normal and active icon side by side, so the two looks are easy to compare.
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label("Icon");
+            icon_field(ui, &mut key.icon, ctx, req);
+        });
+        ui.add_space(18.0);
+        ui.vertical(|ui| {
+            ui.label("Active icon").on_hover_text(
+                "Shown while the key is active, e.g. when its audio device is the default. \
+                 Without it, active keys get a green border.",
+            );
+            icon_field(ui, &mut key.icon_active, ctx, req);
+        });
+    });
+    ui.add_space(8.0);
     egui::Grid::new("appearance")
         .num_columns(2)
         .spacing([8.0, 6.0])
         .show(ui, |ui| {
-            ui.label("Icon");
-            icon_field(ui, &mut key.icon, ctx, req);
-            ui.end_row();
-
-            ui.label("Active icon").on_hover_text(
-                "Shown while the key is active, e.g. when its audio device is the default. \
-             Without it, active keys get a green border.",
-            );
-            icon_field(ui, &mut key.icon_active, ctx, req);
-            ui.end_row();
-
             ui.label("Title");
             let mut title = key.title.clone().unwrap_or_default();
             if ui
@@ -244,22 +251,92 @@ fn import_icon(src: &Path, base: &Path) -> Result<PathBuf, String> {
     unreachable!("the loop only ends by returning")
 }
 
+/// Texture of an icon file for the editor, cached per file version (a file
+/// that fails to load is cached as `None` so it is not retried every frame).
+fn thumbnail(ui: &Ui, path: &Path) -> Option<TextureHandle> {
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let id = Id::new(("thumb", path, mtime));
+    if let Some(cached) = ui.data(|d| d.get_temp::<Option<TextureHandle>>(id)) {
+        return cached;
+    }
+    let tex = image::open(path).ok().map(|img| {
+        let img = img.thumbnail(112, 112).to_rgba8();
+        let size = [img.width() as usize, img.height() as usize];
+        let image = ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+        ui.ctx().load_texture(
+            format!("thumb-{}", path.display()),
+            image,
+            TextureOptions::LINEAR,
+        )
+    });
+    ui.data_mut(|d| d.insert_temp(id, tex.clone()));
+    tex
+}
+
+/// A clickable thumbnail of the icon (click to choose another) and a remove button.
 fn icon_field(ui: &mut Ui, icon: &mut Option<PathBuf>, ctx: &EditorCtx, req: &mut Requests) {
     ui.horizontal(|ui| {
-        let text = icon.as_ref().map_or("none".to_string(), |p| {
-            p.file_name().map_or(p.display().to_string(), |f| {
-                f.to_string_lossy().into_owned()
-            })
-        });
-        let hover = icon
-            .as_ref()
-            .map_or(String::new(), |p| p.display().to_string());
-        ui.allocate_ui(egui::vec2(150.0, 18.0), |ui| {
-            ui.set_width(150.0);
-            ui.add(egui::Label::new(RichText::new(text).monospace()).truncate())
-                .on_hover_text(hover);
-        });
-        if ui.button("Browse…").clicked() {
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::click());
+        let painter = ui.painter();
+        painter.rect_filled(rect, 8.0, Color32::from_gray(30));
+        let path = icon.as_ref().map(|p| ctx.base_dir.join(p));
+        match path.as_deref().map(|p| thumbnail(ui, p)) {
+            Some(Some(tex)) => {
+                // Fit the image inside the box, keeping its aspect ratio.
+                let [w, h] = tex.size().map(|v| v as f32);
+                let inner = rect.shrink(4.0);
+                let scale = (inner.width() / w).min(inner.height() / h);
+                let img_rect = Rect::from_center_size(inner.center(), Vec2::new(w, h) * scale);
+                painter.add(
+                    egui::epaint::RectShape::filled(img_rect, 6.0, Color32::WHITE).with_texture(
+                        tex.id(),
+                        Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    ),
+                );
+            }
+            Some(None) => {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "⚠",
+                    egui::FontId::proportional(20.0),
+                    Color32::from_rgb(230, 90, 80),
+                );
+            }
+            None => {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "+",
+                    egui::FontId::proportional(24.0),
+                    Color32::from_gray(110),
+                );
+            }
+        }
+        let stroke = if resp.hovered() {
+            Stroke::new(1.5, Color32::from_gray(160))
+        } else {
+            Stroke::new(1.0, Color32::from_gray(60))
+        };
+        painter.rect_stroke(rect, 8.0, stroke, StrokeKind::Inside);
+        let hover = match &path {
+            Some(p) if p.exists() => format!(
+                "{}
+Click to choose another image",
+                p.display()
+            ),
+            Some(p) => format!(
+                "Missing file: {}
+Click to choose another image",
+                p.display()
+            ),
+            None => "Click to choose an image".to_string(),
+        };
+        if resp
+            .on_hover_text(hover)
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
             let picked = rfd::FileDialog::new()
                 .set_title("Choose an icon")
                 .add_filter(
