@@ -72,19 +72,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
-name = "chechudock"
-version = "0.1.0"
-dependencies = [
- "ab_glyph",
- "ajazz-hid",
- "image",
- "serde",
- "serde_json",
- "toml",
- "windows-sys",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -224,6 +211,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "opendock"
+version = "0.1.0"
+dependencies = [
+ "ab_glyph",
+ "ajazz-hid",
+ "image",
+ "serde",
+ "serde_json",
+ "toml",
+ "windows-sys",
 ]
 
 [[package]]

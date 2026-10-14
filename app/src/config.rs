@@ -320,12 +320,12 @@ impl Config {
     }
 }
 
-/// `%APPDATA%\chechudock\config.toml`
+/// `%APPDATA%\opendock\config.toml`
 pub fn default_path() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| ".".into());
-    base.join("chechudock").join("config.toml")
+    base.join("opendock").join("config.toml")
 }
 
 #[cfg(test)]

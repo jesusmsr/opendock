@@ -1,9 +1,9 @@
-# chechudock
+# opendock
 
 A lightweight controller for the AJAZZ AKP153E (Mirabox 293S V3) stream deck,
 replacing the vendor "Stream Dock AJAZZ" app.
 
-| | Vendor app | chechudock |
+| | Vendor app | opendock |
 |---|---|---|
 | Processes | 20 | 1 |
 | RAM | ~900 MB | ~8 MB |
@@ -11,7 +11,7 @@ replacing the vendor "Stream Dock AJAZZ" app.
 
 ## Layout
 
-- `app/`: the `chechudock` program
+- `app/`: the `opendock` program
 - `crates/ajazz-hid/`: the device's USB protocol, layout and image format
 - `tools/probe/`: hardware test tool (test patterns, key event logging)
 
@@ -20,14 +20,14 @@ replacing the vendor "Stream Dock AJAZZ" app.
 Quit the vendor app first: only one program can drive the device.
 
 ```
-chechudock import      # one-time: convert the vendor app's active profile
-chechudock check       # validate the config
-chechudock             # run (reconnects automatically, reloads config on save)
-chechudock preview out # render every key to PNG
+opendock import      # one-time: convert the vendor app's active profile
+opendock check       # validate the config
+opendock             # run (reconnects automatically, reloads config on save)
+opendock preview out # render every key to PNG
 ```
 
-The config is `%APPDATA%\chechudock\config.toml` (override with `--config <file>`).
-The log is `chechudock.log` next to it.
+The config is `%APPDATA%\opendock\config.toml` (override with `--config <file>`).
+The log is `opendock.log` next to it.
 
 ## Config
 
@@ -73,6 +73,6 @@ Modifiers: `ctrl`, `shift`, `alt`, `win`.
 Needs Rust (MSVC toolchain) and the Visual Studio C++ Build Tools.
 
 ```
-cargo build --release   # target/release/chechudock.exe
+cargo build --release   # target/release/opendock.exe
 cargo test --workspace
 ```

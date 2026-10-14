@@ -1,4 +1,4 @@
-//! chechudock - lightweight controller for AJAZZ Stream Dock devices.
+//! opendock - lightweight controller for AJAZZ Stream Dock devices.
 
 mod actions;
 mod config;
@@ -18,9 +18,9 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
 const USAGE: &str = "\
-chechudock - lightweight controller for AJAZZ Stream Dock devices
+opendock - lightweight controller for AJAZZ Stream Dock devices
 
-USAGE: chechudock [--config <file>] [command]
+USAGE: opendock [--config <file>] [command]
 
 COMMANDS:
   run (default)        Drive the device until closed
@@ -30,8 +30,8 @@ COMMANDS:
                        (default: the one active on your device)
   preview <dir>        Render every key to PNG files for a quick look
 
-The config defaults to %APPDATA%\\chechudock\\config.toml.
-The log is written next to it as chechudock.log.
+The config defaults to %APPDATA%\\opendock\\config.toml.
+The log is written next to it as opendock.log.
 ";
 
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -61,9 +61,9 @@ fn fail(msg: &str) -> ! {
     exit(1);
 }
 
-/// Returns false if another chechudock is already running.
+/// Returns false if another opendock is already running.
 fn single_instance() -> bool {
-    let name: Vec<u16> = "Local\\chechudock-single-instance\0"
+    let name: Vec<u16> = "Local\\opendock-single-instance\0"
         .encode_utf16()
         .collect();
     // SAFETY: valid NUL-terminated name; the handle is intentionally leaked so
@@ -101,13 +101,13 @@ fn main() {
 
     match args.first().map(String::as_str).unwrap_or("run") {
         "run" => {
-            let _ = LOG_PATH.set(config_dir.join("chechudock.log"));
+            let _ = LOG_PATH.set(config_dir.join("opendock.log"));
             if !single_instance() {
-                fail("chechudock is already running");
+                fail("opendock is already running");
             }
             let cfg = config::Config::load(&config_path).unwrap_or_else(|e| {
                 fail(&format!(
-                    "{e}\n(run `chechudock import` to create a config from the vendor app)"
+                    "{e}\n(run `opendock import` to create a config from the vendor app)"
                 ))
             });
             log(&format!("using {}", config_path.display()));

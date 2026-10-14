@@ -1,5 +1,5 @@
 [package]
-name = "chechudock"
+name = "opendock"
 description = "Lightweight controller for AJAZZ Stream Dock devices"
 version.workspace = true
 edition.workspace = true
