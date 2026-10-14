@@ -27,7 +27,10 @@ Double-click `opendock.exe` to open the **settings window**:
   action (with a **Test** button); hotkeys can be recorded from the keyboard and
   audio devices are picked from a list of the ones connected
 - pages can be added, renamed, deleted and set as home
-- **⚙ Settings**: start opendock with Windows, deck brightness, title font
+- the **small screen** preview sits right of the keys (live values); click it to
+  choose up to 4 stacked widgets: CPU/GPU temperature, CPU/GPU usage, VRAM, RAM,
+  clock, date or text
+- **⚙ Settings**: start opendock with Windows, sensors, deck brightness, title font
 - **Save** (Ctrl+S) writes the config; a running engine applies it immediately
 - **Start/Stop** at the bottom controls the engine; ☰ → *Import from Stream Dock
   AJAZZ* converts the vendor app's profile
@@ -92,6 +95,27 @@ name (case-insensitive); `opendock audio` lists the names. A key that selects a
 single device is **active** while that device is the default: it shows
 `icon_active` if set, otherwise a green border. Switching sets the device for
 all roles (media, games and calls).
+
+Small screen (90x394 px, drawn as one canvas):
+
+```toml
+[side]
+widgets = [
+    { kind = "cpu_temp" },
+    { kind = "gpu_temp" },
+    { kind = "gpu_usage", label = "GPU" },
+]
+```
+
+Kinds: `cpu_temp`, `cpu_usage`, `gpu_temp`, `gpu_usage`, `gpu_memory`, `ram`,
+`clock`, `date`, `text` (with `text = "..."`).
+
+GPU values come from the NVIDIA driver, CPU usage and RAM from Windows; none
+need admin rights. **CPU temperature** needs [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor):
+⚙ Settings → Sensors can install it (with the PawnIO driver it uses) and start it
+at sign-in, after one administrator prompt. opendock reads it from LHM's web
+server on `127.0.0.1:8085`, so an LHM you run yourself with the web server
+enabled works too.
 
 Hotkey names: letters, digits, `f1`-`f24`, `esc`, `enter`, `tab`, `space`,
 `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`,

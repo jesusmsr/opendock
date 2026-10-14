@@ -17,7 +17,9 @@ use crate::audio::{self, Endpoint, Flow};
 use crate::config::{Action, Config, Key};
 use crate::instance::EngineLock;
 use crate::log;
-use crate::render::Renderer;
+use crate::render::{self, Renderer};
+use crate::sensors::Sensors;
+use crate::side;
 use crate::tray::Status;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
@@ -39,6 +41,7 @@ struct State {
     /// depends on system state (e.g. the default audio device) update at once.
     done_tx: Sender<()>,
     done_rx: Receiver<()>,
+    sensors: Sensors,
 }
 
 /// System state that changes what keys look like.
@@ -98,6 +101,7 @@ impl State {
             live: Live::default(),
             done_tx,
             done_rx,
+            sensors: Sensors::new(Duration::from_secs(1)),
         }
     }
 
@@ -175,8 +179,27 @@ impl State {
     }
 }
 
-/// Brings the device in line with the current page, uploading only keys
-/// whose image changed.
+/// Shows `jpeg` on image slot `id` (or clears it), unless it already shows
+/// exactly that. Returns whether anything was sent.
+fn show(dev: &Device, st: &mut State, id: u8, jpeg: Option<&[u8]>) -> ajazz_hid::Result<bool> {
+    let hash = jpeg.map(|j| {
+        let mut h = DefaultHasher::new();
+        j.hash(&mut h);
+        h.finish()
+    });
+    if st.shown.get(&id) == Some(&hash) {
+        return Ok(false);
+    }
+    match jpeg {
+        Some(j) => dev.set_key_image(id, j)?,
+        None => dev.clear_key(id)?,
+    }
+    st.shown.insert(id, hash);
+    Ok(true)
+}
+
+/// Brings the device in line with the current page and the small screen,
+/// uploading only images that changed.
 fn draw_page(dev: &Device, st: &mut State) -> ajazz_hid::Result<()> {
     st.refresh_live();
     let mut changed = false;
@@ -187,26 +210,37 @@ fn draw_page(dev: &Device, st: &mut State) -> ajazz_hid::Result<()> {
                 let active = st.live.is_active(&key);
                 st.renderer.jpeg(&key, active)
             });
-            let hash = jpeg.as_ref().map(|j| {
-                let mut h = DefaultHasher::new();
-                j.hash(&mut h);
-                h.finish()
-            });
-            if st.shown.get(&id) == Some(&hash) {
-                continue;
-            }
-            match &jpeg {
-                Some(j) => dev.set_key_image(id, j)?,
-                None => dev.clear_key(id)?,
-            }
-            st.shown.insert(id, hash);
-            changed = true;
+            changed |= show(dev, st, id, jpeg.as_deref())?;
         }
     }
+    changed |= draw_side(dev, st)?;
     if changed {
         dev.flush()?;
     }
     Ok(())
+}
+
+/// Redraws the small screen from the current readings.
+fn draw_side(dev: &Device, st: &mut State) -> ajazz_hid::Result<bool> {
+    let mut changed = false;
+    if st.cfg.side.widgets.is_empty() {
+        for (id, _) in akp153e::side::SLOTS {
+            changed |= show(dev, st, id, None)?;
+        }
+        return Ok(changed);
+    }
+    let readings = st.sensors.read().clone();
+    let canvas = side::draw(
+        st.renderer.font(),
+        &st.cfg.side,
+        &readings,
+        side::Now::local(),
+    );
+    for (id, slice) in side::slices(&canvas) {
+        let jpeg = render::encode(&slice);
+        changed |= show(dev, st, id, Some(&jpeg))?;
+    }
+    Ok(changed)
 }
 
 fn on_press(st: &mut State, id: u8) -> bool {

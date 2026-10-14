@@ -8,7 +8,9 @@ use eframe::egui::{
 };
 
 use crate::audio::{self, Endpoint};
-use crate::config::{Action, Align, AudioTarget, Key, Media, Run};
+use crate::config::{
+    Action, Align, AudioTarget, Key, Media, Run, Side, Widget, WidgetKind, MAX_SIDE_WIDGETS,
+};
 use crate::keys;
 
 /// Read-only data the editor needs from the app.
@@ -730,4 +732,100 @@ fn audio_ui(ui: &mut Ui, target: &mut AudioTarget, devices: &[Endpoint], req: &m
     } else {
         AudioTarget::Cycle(list)
     };
+}
+
+const WIDGETS: [(WidgetKind, &str); 9] = [
+    (WidgetKind::CpuTemp, "CPU temperature"),
+    (WidgetKind::CpuUsage, "CPU usage"),
+    (WidgetKind::GpuTemp, "GPU temperature"),
+    (WidgetKind::GpuUsage, "GPU usage"),
+    (WidgetKind::GpuMemory, "GPU memory (VRAM)"),
+    (WidgetKind::Ram, "RAM"),
+    (WidgetKind::Clock, "Clock"),
+    (WidgetKind::Date, "Date"),
+    (WidgetKind::Text, "Text"),
+];
+
+fn widget_label(k: WidgetKind) -> &'static str {
+    WIDGETS
+        .iter()
+        .find(|(x, _)| *x == k)
+        .map_or("?", |(_, l)| l)
+}
+
+/// Editor for the small screen: an ordered list of up to four widgets.
+pub fn side_ui(ui: &mut Ui, side: &mut Side, cpu_temp_available: bool) {
+    ui.label(RichText::new("Small screen").strong());
+    ui.weak("Widgets are stacked from top to bottom and share the screen equally.");
+    ui.add_space(6.0);
+
+    let n = side.widgets.len();
+    let mut swap = None;
+    let mut remove = None;
+    for (i, w) in side.widgets.iter_mut().enumerate() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{}.", i + 1)).strong());
+                ComboBox::from_id_salt(("widget", i))
+                    .width(170.0)
+                    .selected_text(widget_label(w.kind))
+                    .show_ui(ui, |ui| {
+                        for (k, l) in WIDGETS {
+                            if ui.selectable_label(w.kind == k, l).clicked() {
+                                w.kind = k;
+                            }
+                        }
+                    });
+                if ui.add_enabled(i > 0, egui::Button::new("⬆").small()).clicked() {
+                    swap = Some((i, i - 1));
+                }
+                if ui.add_enabled(i + 1 < n, egui::Button::new("⬇").small()).clicked() {
+                    swap = Some((i, i + 1));
+                }
+                if ui.small_button("🗙").clicked() {
+                    remove = Some(i);
+                }
+            });
+            egui::Grid::new(("widget_fields", i)).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+                if w.kind == WidgetKind::Text {
+                    ui.label("Text");
+                    let mut text = w.text.clone().unwrap_or_default();
+                    if ui.add(egui::TextEdit::multiline(&mut text).desired_rows(2).desired_width(180.0)).changed() {
+                        w.text = (!text.is_empty()).then_some(text);
+                    }
+                    ui.end_row();
+                }
+                ui.label("Caption");
+                let mut label = w.label.clone().unwrap_or_default();
+                let hint = if w.kind == WidgetKind::Text { "none" } else { "default" };
+                if ui.add(egui::TextEdit::singleline(&mut label).hint_text(hint).desired_width(180.0)).changed() {
+                    w.label = (!label.is_empty()).then_some(label);
+                }
+                ui.end_row();
+            });
+            if w.kind == WidgetKind::CpuTemp && !cpu_temp_available {
+                ui.colored_label(
+                    Color32::from_rgb(240, 190, 80),
+                    "CPU temperature needs LibreHardwareMonitor: set it up in ⚙ Settings > Sensors.",
+                );
+            }
+        });
+    }
+    if let Some((a, b)) = swap {
+        side.widgets.swap(a, b);
+    }
+    if let Some(i) = remove {
+        side.widgets.remove(i);
+    }
+    ui.add_space(4.0);
+    let can_add = side.widgets.len() < MAX_SIDE_WIDGETS;
+    if ui
+        .add_enabled(can_add, egui::Button::new("➕ Add widget"))
+        .clicked()
+    {
+        side.widgets.push(Widget::new(WidgetKind::Clock));
+    }
+    if side.widgets.is_empty() {
+        ui.weak("No widgets: the small screen stays dark.");
+    }
 }

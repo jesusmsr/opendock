@@ -54,6 +54,10 @@ impl Renderer {
 
     /// Identifies what `key` looks like: only the visual fields (not its
     /// position or action) plus the icon file's modification time.
+    pub fn font(&self) -> Option<&FontVec> {
+        self.font.as_ref()
+    }
+
     pub fn look_id(&self, key: &Key, active: bool) -> u64 {
         let mut h = DefaultHasher::new();
         (&key.icon, &key.icon_active, &key.title, &key.color).hash(&mut h);
@@ -209,6 +213,45 @@ fn draw_title(img: &mut RgbImage, font: &FontVec, text: &str, size: u16, align: 
                 let v = p[c] as f32 * (1.0 - o * 0.85); // darken under the outline
                 p[c] = (v * (1.0 - fill) + 255.0 * fill) as u8;
             }
+        }
+    }
+}
+
+/// Width in pixels of one line of `text`.
+pub fn text_width(font: &FontVec, text: &str, size: f32) -> f32 {
+    let sf = font.as_scaled(PxScale::from(size));
+    text.chars().map(|c| sf.h_advance(font.glyph_id(c))).sum()
+}
+
+/// Draws one line of `text` horizontally centred on `cx`, with its top at `top`.
+pub fn draw_text_line(
+    img: &mut RgbImage,
+    font: &FontVec,
+    text: &str,
+    size: f32,
+    cx: f32,
+    top: f32,
+    color: Rgb<u8>,
+) {
+    let scale = PxScale::from(size);
+    let sf = font.as_scaled(scale);
+    let mut x = cx - text_width(font, text, size) / 2.0;
+    let baseline = top + sf.ascent();
+    for c in text.chars() {
+        let gid = font.glyph_id(c);
+        let glyph = gid.with_scale_and_position(scale, point(x, baseline));
+        x += sf.h_advance(gid);
+        if let Some(og) = font.outline_glyph(glyph) {
+            let b = og.px_bounds();
+            og.draw(|gx, gy, cov| {
+                let (px, py) = (b.min.x as i32 + gx as i32, b.min.y as i32 + gy as i32);
+                if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                    let p = img.get_pixel_mut(px as u32, py as u32);
+                    for ch in 0..3 {
+                        p[ch] = (p[ch] as f32 * (1.0 - cov) + color[ch] as f32 * cov) as u8;
+                    }
+                }
+            });
         }
     }
 }

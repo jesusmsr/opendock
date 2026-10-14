@@ -31,6 +31,67 @@ pub struct Config {
     pub font: Option<PathBuf>,
     #[serde(default)]
     pub pages: HashMap<String, Vec<Key>>,
+    /// The small screen to the right of the keys.
+    #[serde(default)]
+    pub side: Side,
+}
+
+/// Widgets stacked top to bottom on the small screen (1 to 4; none = blank).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct Side {
+    #[serde(default)]
+    pub widgets: Vec<Widget>,
+}
+
+pub const MAX_SIDE_WIDGETS: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct Widget {
+    pub kind: WidgetKind,
+    /// Replaces the default caption (e.g. "GPU").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Text shown by the `text` widget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetKind {
+    Clock,
+    Date,
+    CpuUsage,
+    CpuTemp,
+    Ram,
+    GpuTemp,
+    GpuUsage,
+    GpuMemory,
+    Text,
+}
+
+impl Widget {
+    pub fn new(kind: WidgetKind) -> Self {
+        Widget {
+            kind,
+            label: None,
+            text: None,
+        }
+    }
+
+    fn to_inline_toml(&self) -> String {
+        let kind = toml::Value::try_from(self.kind).expect("kind serializes to a string");
+        let mut out = format!("{{ kind = {kind}");
+        if let Some(l) = &self.label {
+            out += &format!(", label = {}", quote(l));
+        }
+        if let Some(t) = &self.text {
+            out += &format!(", text = {}", quote(t));
+        }
+        out + " }"
+    }
 }
 
 fn default_brightness() -> u8 {
@@ -45,6 +106,7 @@ impl Default for Config {
             home: default_home(),
             font: None,
             pages: HashMap::from([(default_home(), Vec::new())]),
+            side: Side::default(),
         }
     }
 }
@@ -299,6 +361,26 @@ impl Config {
         if let Some(f) = &self.font {
             out += &format!("font = {}\n", quote(&f.to_string_lossy()));
         }
+        if !self.side.widgets.is_empty() {
+            let w: Vec<String> = self
+                .side
+                .widgets
+                .iter()
+                .map(Widget::to_inline_toml)
+                .collect();
+            out += &format!(
+                "
+[side]
+widgets = [
+    {},
+]
+",
+                w.join(
+                    ",
+    "
+                )
+            );
+        }
         let mut names: Vec<&String> = self.pages.keys().collect();
         names.sort_by_key(|n| (*n != &self.home, n.as_str()));
         for name in names {
@@ -394,6 +476,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.side.widgets.len() > MAX_SIDE_WIDGETS {
+            return Err(format!("[side] has more than {MAX_SIDE_WIDGETS} widgets"));
+        }
         if !self.pages.contains_key(&self.home) {
             return Err(format!(
                 "home page {:?} is not defined under [pages]",
@@ -495,6 +580,8 @@ mod tests {
             [[pages.other]]
             pos = "1,2"
             action = { audio_input = "Microphone" }
+            [side]
+            widgets = [{ kind = "gpu_temp" }, { kind = "text", text = "hi", label = "Note" }]
         "#;
         let cfg: Config = toml::from_str(src).unwrap();
         let again: Config = toml::from_str(&cfg.to_toml()).unwrap();

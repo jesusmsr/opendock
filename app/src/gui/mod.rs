@@ -17,7 +17,9 @@ use eframe::egui::{
 use crate::audio::{self, Endpoint, Flow};
 use crate::config::{Action, Config, Key, Pos, Run};
 use crate::render::Renderer;
-use crate::{actions, autostart, icon, import, instance};
+use crate::sensors::{Readings, Sensors};
+use crate::side;
+use crate::{actions, autostart, icon, import, instance, lhm};
 use editor::EditorCtx;
 
 const ACCENT: Color32 = Color32::from_rgb(80, 160, 255);
@@ -50,6 +52,13 @@ pub fn run(config_path: PathBuf) -> eframe::Result {
     )
 }
 
+/// Messages from the background thread that checks, installs or removes LHM.
+enum LhmEvent {
+    Status(lhm::Status),
+    Progress(String),
+    Done(Result<(), String>),
+}
+
 enum Dialog {
     Settings,
     NewPage(String),
@@ -74,6 +83,16 @@ struct SettingsApp {
     saved_toml: String,
     page: String,
     selected: Option<Pos>,
+    /// The small screen is selected in the inspector (instead of a key).
+    side_selected: bool,
+    sensors: Sensors,
+    readings: Readings,
+    /// Preview texture of the small screen and what it was drawn from.
+    side_tex: Option<(u64, TextureHandle)>,
+    /// LibreHardwareMonitor status (None while it is being checked).
+    lhm_status: Option<lhm::Status>,
+    lhm_rx: Option<Receiver<LhmEvent>>,
+    lhm_progress: Option<String>,
     renderer: Renderer,
     textures: HashMap<u64, TextureHandle>,
     /// Font the renderer was built with; rebuilt when the config's font changes.
@@ -156,6 +175,13 @@ impl SettingsApp {
             cfg,
             saved_toml,
             selected: None,
+            side_selected: false,
+            sensors: Sensors::new(Duration::from_secs(1)),
+            readings: Readings::default(),
+            side_tex: None,
+            lhm_status: None,
+            lhm_rx: None,
+            lhm_progress: None,
             textures: HashMap::new(),
             renderer_font: None,
             drag_from: None,
@@ -245,6 +271,101 @@ impl SettingsApp {
             .clone()
     }
 
+    /// The Sensors section of the Settings dialog.
+    fn sensors_settings(&mut self, ui: &mut egui::Ui) {
+        ui.weak("GPU, CPU usage and RAM are read by opendock directly.");
+        let cpu = self.readings.cpu_temp;
+        ui.horizontal(|ui| {
+            status_dot(ui, if cpu.is_some() { OK } else { Color32::GRAY });
+            ui.label(match cpu {
+                Some(t) => format!("CPU temperature: {t:.0}°"),
+                None => "CPU temperature: not available".to_string(),
+            });
+        });
+        if let Some(p) = &self.lhm_progress {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(p.as_str());
+            });
+            return;
+        }
+        let Some(st) = self.lhm_status.clone() else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.weak("Checking LibreHardwareMonitor…");
+            });
+            return;
+        };
+        if st.installed {
+            let mut parts = vec!["LibreHardwareMonitor installed"];
+            parts.push(if st.autostart {
+                "starts at sign-in"
+            } else {
+                "start-up task missing"
+            });
+            parts.push(if st.running { "running" } else { "not running" });
+            ui.label(parts.join(" · "));
+            if st.running && !st.cpu_temp {
+                ui.colored_label(
+                    Color32::from_rgb(240, 190, 80),
+                    "It runs, but reports no CPU temperature yet.",
+                );
+            }
+            ui.horizontal(|ui| {
+                if !st.autostart
+                    && ui
+                        .button("Repair")
+                        .on_hover_text("Reinstall and re-register the start-up task")
+                        .clicked()
+                {
+                    self.run_lhm_job(true);
+                }
+                if ui.button("Uninstall").clicked() {
+                    self.run_lhm_job(false);
+                }
+            });
+        } else if st.running {
+            ui.label("A LibreHardwareMonitor you run yourself is providing sensors.");
+        } else {
+            ui.label("CPU temperature needs LibreHardwareMonitor (free, open source).");
+            if ui.button("Install LibreHardwareMonitor").clicked() {
+                self.run_lhm_job(true);
+            }
+            ui.weak(
+                "Downloads LHM and the PawnIO driver it uses from their official GitHub releases, and starts LHM minimized at sign-in. Windows asks for administrator permission once.",
+            );
+        }
+    }
+
+    /// Texture of the small screen as the deck would show it right now.
+    fn side_texture(&mut self, ctx: &egui::Context) -> TextureHandle {
+        use std::hash::{Hash, Hasher};
+        let now = side::Now::local();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (
+            &self.cfg.side,
+            now,
+            format!("{:?}", self.readings),
+            &self.renderer_font,
+        )
+            .hash(&mut h);
+        let id = h.finish();
+        if let Some((tid, tex)) = &self.side_tex {
+            if *tid == id {
+                return tex.clone();
+            }
+        }
+        let img = side::draw(self.renderer.font(), &self.cfg.side, &self.readings, now);
+        let size = [img.width() as usize, img.height() as usize];
+        let tex = ctx.load_texture(
+            "side",
+            ColorImage::from_rgb(size, img.as_raw()),
+            TextureOptions::LINEAR,
+        );
+        self.side_tex = Some((id, tex.clone()));
+        tex
+    }
+
     fn move_key(&mut self, from: Pos, to: Pos) {
         if from == to {
             return;
@@ -282,8 +403,74 @@ impl SettingsApp {
         self.engine_checked = Instant::now() - Duration::from_millis(700);
     }
 
+    /// Checks LibreHardwareMonitor's status in the background.
+    fn check_lhm(&mut self) {
+        if self.lhm_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        self.lhm_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(LhmEvent::Status(lhm::status()));
+        });
+    }
+
+    /// Installs (or removes) LibreHardwareMonitor in the background.
+    fn run_lhm_job(&mut self, install: bool) {
+        let (tx, rx) = channel();
+        self.lhm_rx = Some(rx);
+        self.lhm_progress = Some(
+            if install {
+                "Starting…"
+            } else {
+                "Removing…"
+            }
+            .into(),
+        );
+        std::thread::spawn(move || {
+            let progress = |m: &str| {
+                let _ = tx.send(LhmEvent::Progress(m.to_string()));
+            };
+            let result = if install {
+                lhm::install(&progress)
+            } else {
+                lhm::uninstall(&progress)
+            };
+            let _ = tx.send(LhmEvent::Done(result));
+            let _ = tx.send(LhmEvent::Status(lhm::status()));
+        });
+    }
+
     /// Background bookkeeping done every frame.
     fn poll(&mut self, ctx: &egui::Context) {
+        let mut finished = false;
+        if let Some(rx) = &self.lhm_rx {
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            for e in events {
+                match e {
+                    LhmEvent::Status(st) => {
+                        self.lhm_status = Some(st);
+                        finished = true;
+                    }
+                    LhmEvent::Progress(m) => self.lhm_progress = Some(m),
+                    LhmEvent::Done(Ok(())) => {
+                        self.lhm_progress = None;
+                        self.set_status("LibreHardwareMonitor updated.", false);
+                    }
+                    LhmEvent::Done(Err(e)) => {
+                        self.lhm_progress = None;
+                        self.set_status(e, true);
+                    }
+                }
+            }
+        }
+        if finished && self.lhm_progress.is_none() {
+            self.lhm_rx = None;
+        }
+        self.readings = self.sensors.read().clone();
         if self.cfg.font != self.renderer_font {
             self.renderer = Renderer::new(self.cfg.font.as_deref(), &self.base_dir);
             self.renderer_font = self.cfg.font.clone();
@@ -396,6 +583,7 @@ impl SettingsApp {
                 });
                 if ui.button("⚙ Settings").clicked() {
                     self.dialog = Some(Dialog::Settings);
+                    self.check_lhm();
                 }
             });
         });
@@ -471,6 +659,14 @@ impl SettingsApp {
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
+        if self.side_selected {
+            egui::ScrollArea::vertical()
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    editor::side_ui(ui, &mut self.cfg.side, self.readings.cpu_temp.is_some())
+                });
+            return;
+        }
         let Some(pos) = self.selected else {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
@@ -522,14 +718,17 @@ impl SettingsApp {
 
     fn grid(&mut self, ui: &mut egui::Ui) {
         // Keys are drawn at device size when there is room, smaller otherwise.
+        // The small screen sits to the right, as tall as the key grid.
+        let aspect = side::ASPECT;
         let avail_w = ui.available_width() - 2.0 * 46.0;
         let gap = 14.0;
-        let size =
-            ((avail_w - (COLS - 1) as f32 * gap) / COLS as f32).clamp(48.0, IMAGE_SIZE as f32);
-        let total = Vec2::new(
-            COLS as f32 * size + (COLS - 1) as f32 * gap,
-            ROWS as f32 * size + (ROWS - 1) as f32 * gap,
-        );
+        let size = ((avail_w - (COLS + 1) as f32 * gap - 2.0 * gap * aspect)
+            / (COLS as f32 + ROWS as f32 * aspect))
+            .clamp(48.0, IMAGE_SIZE as f32);
+        let keys_w = COLS as f32 * size + (COLS - 1) as f32 * gap;
+        let keys_h = ROWS as f32 * size + (ROWS - 1) as f32 * gap;
+        let side_w = keys_h * aspect;
+        let total = Vec2::new(keys_w + 2.0 * gap + side_w, keys_h);
         let avail = ui.available_rect_before_wrap();
         let origin = Pos2::new(
             (avail.center().x - total.x / 2.0).max(avail.left() + 30.0),
@@ -556,6 +755,33 @@ impl SettingsApp {
         let released = ui.input(|i| i.pointer.any_released());
         let ctx = ui.ctx().clone();
         let mut dragged_tex = None;
+
+        // Small screen preview with live readings.
+        let side_rect = Rect::from_min_size(
+            origin + Vec2::new(keys_w + 2.0 * gap, 0.0),
+            Vec2::new(side_w, keys_h),
+        );
+        let side_resp = ui.interact(side_rect, Id::new("side"), Sense::click());
+        let tex = self.side_texture(&ctx);
+        painter.add(
+            egui::epaint::RectShape::filled(side_rect, 8.0, Color32::WHITE)
+                .with_texture(tex.id(), FULL_UV),
+        );
+        let stroke = if self.side_selected {
+            Stroke::new(3.0, ACCENT)
+        } else if side_resp.hovered() {
+            Stroke::new(1.5, Color32::from_gray(140))
+        } else {
+            Stroke::new(1.0, Color32::from_gray(55))
+        };
+        painter.rect_stroke(side_rect, 8.0, stroke, StrokeKind::Outside);
+        if side_resp
+            .on_hover_text("Small screen: click to choose what it shows")
+            .clicked()
+        {
+            self.side_selected = true;
+            self.selected = None;
+        }
 
         for row in 0..ROWS {
             for col in 0..COLS {
@@ -607,9 +833,11 @@ impl SettingsApp {
                 if resp.drag_started() && key.is_some() {
                     self.drag_from = Some(pos);
                     self.selected = Some(pos);
+                    self.side_selected = false;
                 }
                 if resp.clicked() {
                     self.selected = Some(pos);
+                    self.side_selected = false;
                 }
             }
         }
@@ -639,7 +867,7 @@ impl SettingsApp {
         painter.text(
             Pos2::new(grid_rect.center().x, grid_rect.bottom() + 44.0),
             egui::Align2::CENTER_CENTER,
-            "Click a key to edit it · drag to move or swap · save to update the deck",
+            "Click a key or the small screen to edit it · drag keys to move or swap · save to update the deck",
             egui::FontId::proportional(13.0),
             Color32::from_gray(120),
         );
@@ -671,6 +899,10 @@ impl SettingsApp {
                         }
                         ui.weak("Runs the engine and its tray icon when you sign in. Applies right away.");
                     });
+                    ui.add_space(10.0);
+
+                    ui.label(RichText::new("Sensors").strong());
+                    ui.indent("sensors", |ui| self.sensors_settings(ui));
                     ui.add_space(10.0);
 
                     ui.label(RichText::new("Deck").strong());

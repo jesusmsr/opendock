@@ -36,6 +36,19 @@ pub mod akp153e {
     /// Clockwise rotation to apply to an upright image before upload.
     pub const IMAGE_ROTATION: u16 = 270;
 
+    /// The small display to the right of the keys, as one upright canvas.
+    /// It is driven through three image slots (ids 16-18) that each show a
+    /// 150 px tall slice; later slots draw over the bottom of earlier ones.
+    /// Measured on hardware with tools/probe (`ruler` and `whole`).
+    pub mod side {
+        pub const WIDTH: u32 = 90;
+        pub const HEIGHT: u32 = 394;
+        /// Height of the image sent to each slot.
+        pub const SLICE_HEIGHT: u32 = 150;
+        /// (slot id, first canvas row it shows).
+        pub const SLOTS: [(u8, u32); 3] = [(16, 0), (17, 145), (18, 267)];
+    }
+
     /// Device key id for a 0-based (row, col), counted from the top-left.
     /// The device numbers keys down each column, starting top-right.
     pub fn key_id(row: u8, col: u8) -> Option<u8> {
@@ -219,6 +232,40 @@ impl Device {
             b"BAT",
             &[(8, be[0]), (9, be[1]), (10, be[2]), (11, be[3]), (12, key)],
         )?;
+        for chunk in jpeg.chunks(self.payload) {
+            self.write_payload(chunk)?;
+        }
+        Ok(())
+    }
+
+    /// Experimental: uploads a JPEG to a rectangle of a secondary screen
+    /// (`DRA` command). Header: `[9..12]` = JPEG length (24-bit BE), `[12]` =
+    /// screen index, then x, y, width, height as 16-bit BE at `[13..21]`.
+    /// Call [`Device::flush`] afterwards.
+    pub fn set_area_image(
+        &self,
+        index: u8,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+        jpeg: &[u8],
+    ) -> Result<()> {
+        let len = jpeg.len();
+        if len > 0xFF_FFFF {
+            return Err(Error::ImageTooLarge(len));
+        }
+        let mut args = vec![
+            (9, (len >> 16) as u8),
+            (10, (len >> 8) as u8),
+            (11, len as u8),
+            (12, index),
+        ];
+        for (i, v) in [x, y, w, h].into_iter().enumerate() {
+            args.push((13 + 2 * i, (v >> 8) as u8));
+            args.push((14 + 2 * i, v as u8));
+        }
+        self.command(b"DRA", &args)?;
         for chunk in jpeg.chunks(self.payload) {
             self.write_payload(chunk)?;
         }

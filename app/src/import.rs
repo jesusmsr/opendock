@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::config::{Action, AudioTarget, Config, Key, Media, Pos, Run};
+use crate::config::{Action, AudioTarget, Config, Key, Media, Pos, Run, Side, Widget, WidgetKind};
 use crate::keys;
 
 pub struct Report {
@@ -93,6 +93,21 @@ fn hotkeys(settings: &Value) -> Vec<Action> {
             )))
         })
         .collect()
+}
+
+/// The opendock widget matching a vendor small-screen action.
+fn side_widget(uuid: &str) -> Option<WidgetKind> {
+    Some(match uuid {
+        "com.hotspot.stream.cpu.temperature" => WidgetKind::CpuTemp,
+        "com.hotspot.stream.cpu" => WidgetKind::CpuUsage,
+        "com.hotspot.stream.Gpu_Temperature" => WidgetKind::GpuTemp,
+        "com.hotspot.stream.Gpu_Core_Utility" => WidgetKind::GpuUsage,
+        "com.mirabox.streamdock.time.action1" | "com.mirabox.streamdock.dateTime.action1" => {
+            WidgetKind::Clock
+        }
+        "com.mirabox.streamdock.calendar.action1" => WidgetKind::Date,
+        _ => return None,
+    })
 }
 
 /// Converts one vendor action; `Err` explains why it could not be.
@@ -189,6 +204,7 @@ pub fn import(profile_dir: &Path, config_dir: &Path) -> Result<Report, String> {
     std::fs::create_dir_all(&icons_dir).map_err(|e| format!("{}: {e}", icons_dir.display()))?;
 
     let mut keys_out = Vec::new();
+    let mut side_widgets = Vec::new();
     let mut notes = Vec::new();
     let actions = manifest
         .get("Actions")
@@ -208,9 +224,11 @@ pub fn import(profile_dir: &Path, config_dir: &Path) -> Result<Report, String> {
         };
         let name = s(a, "Name").unwrap_or("?");
         if ajazz_hid::akp153e::key_id(row, col).is_none() {
-            notes.push(format!(
-                "skipped {name:?} on the small screen (col {col}, row {row}) - not supported yet"
-            ));
+            // Column 5 is the small screen; positions sort top to bottom.
+            match side_widget(s(a, "UUID").unwrap_or("")) {
+                Some(kind) => side_widgets.push(Widget::new(kind)),
+                None => notes.push(format!("small screen: {name:?} is not supported, skipped")),
+            }
             continue;
         }
         let pos = Pos { row, col };
@@ -271,6 +289,9 @@ pub fn import(profile_dir: &Path, config_dir: &Path) -> Result<Report, String> {
         home: "main".into(),
         font: None,
         pages: HashMap::from([("main".to_string(), keys_out)]),
+        side: Side {
+            widgets: side_widgets,
+        },
     };
     Ok(Report { config, notes })
 }

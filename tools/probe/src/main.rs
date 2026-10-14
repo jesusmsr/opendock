@@ -12,7 +12,7 @@ use std::process::{exit, Command};
 use std::time::{Duration, Instant};
 
 use ajazz_hid::{Device, HidApi};
-use pattern::{orient, test_pattern, to_jpeg, Orientation};
+use pattern::{canvas_slice, orient, ruler, test_pattern, to_jpeg, Orientation};
 
 const USAGE: &str = "\
 probe - AJAZZ Stream Dock hardware probe
@@ -22,7 +22,12 @@ USAGE: probe <command> [options]
 COMMANDS:
   info                 List attached devices and detect the packet size
   variants             Show 15 size/orientation variants labelled A..O, then listen
-  numbers              Show each key's id (1..=last) using --size/--rot/--flip, then listen
+  numbers              Show each key's id (first..=last) using --size/--rot/--flip, then listen
+  ruler                Calibration grid of --w x --h on ids first..=last (uses --rot)
+  whole                One tall ruler canvas split over ids 16-18: slot 16 shows rows from 0,
+                       slot 17 from --o2, slot 18 from --o3; each slice is --h tall (uses --rot)
+  dra                  Experimental: --w x --h ruler sent with the DRA command to
+                       screen --idx at --x,--y (uses --rot)
   listen               Log key events only
   brightness <0-100>   Set screen brightness
   clear                Clear all keys
@@ -34,7 +39,15 @@ OPTIONS:
   --size <px>    Image size for `numbers` (default 85)
   --rot <deg>    Rotation for `numbers`: 0, 90, 180, 270 (default 0)
   --flip         Mirror horizontally for `numbers`
+  --first <n>    Lowest key id for `numbers` (default 1)
   --last <n>     Highest key id for `numbers` (default 18)
+  --w <px>       Width for `ruler`/`whole` as seen on the screen (default 96)
+  --h <px>       Height for `ruler`/`whole` as seen on the screen (default 96)
+  --gap <px>     Rows skipped between slots for `ruler` stacking (default 0)
+  --o2 <px>, --o3 <px>  Canvas rows where slots 17 and 18 start for `whole`
+                 (default --h + --gap and twice that)
+  --idx <n>      Screen index for `dra` (default 0)
+  --x <px>, --y <px>  Position for `dra` (default 0, 0)
   --secs <n>     How long to listen (default 60)
   --force        Run even if the vendor Stream Dock app is open
 ";
@@ -61,7 +74,16 @@ struct Opts {
     size: u32,
     rot: u16,
     flip: bool,
+    first: u8,
     last: u8,
+    w: u32,
+    h: u32,
+    gap: u32,
+    o2: Option<u32>,
+    o3: Option<u32>,
+    idx: u8,
+    x: u16,
+    y: u16,
     secs: u64,
     force: bool,
     positional: Vec<String>,
@@ -73,7 +95,16 @@ fn parse_args() -> Opts {
         size: 85,
         rot: 0,
         flip: false,
+        first: 1,
         last: 18,
+        w: 96,
+        h: 96,
+        gap: 0,
+        o2: None,
+        o3: None,
+        idx: 0,
+        x: 0,
+        y: 0,
         secs: 60,
         force: false,
         positional: Vec::new(),
@@ -93,7 +124,16 @@ fn parse_args() -> Opts {
             "--size" => o.size = num(val("--size"), "--size") as u32,
             "--rot" => o.rot = num(val("--rot"), "--rot") as u16,
             "--flip" => o.flip = true,
+            "--first" => o.first = num(val("--first"), "--first") as u8,
             "--last" => o.last = num(val("--last"), "--last") as u8,
+            "--w" => o.w = num(val("--w"), "--w") as u32,
+            "--h" => o.h = num(val("--h"), "--h") as u32,
+            "--gap" => o.gap = num(val("--gap"), "--gap") as u32,
+            "--o2" => o.o2 = Some(num(val("--o2"), "--o2") as u32),
+            "--o3" => o.o3 = Some(num(val("--o3"), "--o3") as u32),
+            "--idx" => o.idx = num(val("--idx"), "--idx") as u8,
+            "--x" => o.x = num(val("--x"), "--x") as u16,
+            "--y" => o.y = num(val("--y"), "--y") as u16,
             "--secs" => o.secs = num(val("--secs"), "--secs"),
             "--force" => o.force = true,
             "-h" | "--help" => {
@@ -217,6 +257,9 @@ fn run(o: &Opts) -> ajazz_hid::Result<()> {
             std::fs::write(&path, to_jpeg(&img)).expect("write preview");
             println!("wrote {path}");
         }
+        let path = format!("{dir}/ruler_{}x{}.jpg", o.w, o.h);
+        std::fs::write(&path, to_jpeg(&ruler(o.w, o.h, 0, "16"))).expect("write preview");
+        println!("wrote {path}");
         return Ok(());
     }
     if cmd.is_empty() {
@@ -269,6 +312,63 @@ fn run(o: &Opts) -> ajazz_hid::Result<()> {
             log("and the white border visible on all four sides.");
             listen(&dev, o.secs)?;
         }
+        "ruler" => {
+            let dev = open(&api, o);
+            let orientation = Orientation {
+                rotate: o.rot,
+                flip_h: o.flip,
+            };
+            for key in o.first..=o.last {
+                let img = orient(ruler(o.w, o.h, 0, &key.to_string()), orientation);
+                if let Err(e) = upload(&dev, key, &to_jpeg(&img)) {
+                    log(&format!("key id {key}: upload failed: {e}"));
+                }
+            }
+            dev.flush()?;
+            log(&format!(
+                "ruler {}x{} on ids {}..={} ({orientation}). Edges: top red, right green, bottom blue, left yellow.",
+                o.w, o.h, o.first, o.last
+            ));
+            listen(&dev, o.secs)?;
+        }
+        "dra" => {
+            let dev = open(&api, o);
+            let orientation = Orientation {
+                rotate: o.rot,
+                flip_h: o.flip,
+            };
+            let img = orient(ruler(o.w, o.h, 0, "D"), orientation);
+            // The rectangle is given in the same orientation as the uploaded image.
+            let (w, h) = (img.width() as u16, img.height() as u16);
+            dev.set_area_image(o.idx, o.x, o.y, w, h, &to_jpeg(&img))?;
+            dev.flush()?;
+            log(&format!(
+                "DRA idx {} at {},{} size {}x{} ({orientation})",
+                o.idx, o.x, o.y, w, h
+            ));
+            listen(&dev, o.secs)?;
+        }
+        "whole" => {
+            let dev = open(&api, o);
+            let orientation = Orientation {
+                rotate: o.rot,
+                flip_h: o.flip,
+            };
+            let o2 = o.o2.unwrap_or(o.h + o.gap);
+            let o3 = o.o3.unwrap_or(2 * (o.h + o.gap));
+            for (key, y0) in [(16u8, 0), (17, o2), (18, o3)] {
+                // Each slot shows the canvas from row y0; later slots draw over
+                // the bottom of earlier ones, so slices may be taller than needed.
+                let img = orient(canvas_slice(o.w, o.h, y0), orientation);
+                upload(&dev, key, &to_jpeg(&img))?;
+            }
+            dev.flush()?;
+            log(&format!(
+                "whole canvas {} wide: slot 16 from row 0, 17 from {o2}, 18 from {o3}, slices {} tall ({orientation})",
+                o.w, o.h
+            ));
+            listen(&dev, o.secs)?;
+        }
         "numbers" => {
             let dev = open(&api, o);
             let orientation = Orientation {
@@ -277,7 +377,7 @@ fn run(o: &Opts) -> ajazz_hid::Result<()> {
             };
             dev.set_brightness(70)?;
             dev.clear_all()?;
-            for key in 1..=o.last {
+            for key in o.first..=o.last {
                 let img = orient(
                     test_pattern(o.size, &key.to_string(), key as u32),
                     orientation,
@@ -288,8 +388,8 @@ fn run(o: &Opts) -> ajazz_hid::Result<()> {
             }
             dev.flush()?;
             log(&format!(
-                "drew ids 1..={} at {}px {orientation}",
-                o.last, o.size
+                "drew ids {}..={} at {}px {orientation}",
+                o.first, o.last, o.size
             ));
             listen(&dev, o.secs)?;
         }

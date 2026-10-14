@@ -148,3 +148,98 @@ pub fn to_jpeg(img: &RgbImage) -> Vec<u8> {
         .expect("JPEG encoding into memory cannot fail");
     out
 }
+
+/// Draws `text` with its top-left corner at (x, y), `scale` pixels per font pixel.
+fn draw_text_at(img: &mut RgbImage, text: &str, x: u32, y: u32, scale: u32, c: Rgb<u8>) {
+    for (i, ch) in text.chars().enumerate() {
+        let gx = x + i as u32 * 6 * scale;
+        for (row, bits) in glyph(ch).iter().enumerate() {
+            for col in 0..5 {
+                if bits & (0x10 >> col) != 0 {
+                    fill_rect(
+                        img,
+                        gx + col * scale,
+                        y + row as u32 * scale,
+                        scale,
+                        scale,
+                        c,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Calibration image: grid lines every 10 px (brighter every 50), coordinate
+/// labels every 20 px along the top and every 10 px down the left, and a 2 px coloured edge on
+/// each side (top red, right green, bottom blue, left yellow) so it is obvious
+/// which edges the screen shows. `y_offset` is added to the vertical labels,
+/// so stacked slices of one tall canvas keep continuous coordinates.
+pub fn ruler(w: u32, h: u32, y_offset: u32, label: &str) -> RgbImage {
+    let mut img = RgbImage::from_pixel(w, h, Rgb([20, 24, 32]));
+    for x in (0..w).step_by(10) {
+        let c = if x.is_multiple_of(50) {
+            Rgb([110, 110, 130])
+        } else {
+            Rgb([50, 52, 64])
+        };
+        fill_rect(&mut img, x, 0, 1, h, c);
+    }
+    for y in 0..h {
+        if (y + y_offset).is_multiple_of(10) {
+            let c = if (y + y_offset).is_multiple_of(50) {
+                Rgb([110, 110, 130])
+            } else {
+                Rgb([50, 52, 64])
+            };
+            fill_rect(&mut img, 0, y, w, 1, c);
+        }
+    }
+    let white = Rgb([235, 235, 235]);
+    for x in (20..w.saturating_sub(10)).step_by(20) {
+        draw_text_at(&mut img, &x.to_string(), x + 2, 4, 1, white);
+    }
+    for y in 0..h.saturating_sub(10) {
+        let v = y + y_offset;
+        if v.is_multiple_of(10) && y > 12 {
+            draw_text_at(&mut img, &v.to_string(), 4, y + 2, 1, white);
+        }
+    }
+    draw_text_at(&mut img, label, w / 2 - 6, h / 2 - 7, 2, Rgb([255, 220, 0]));
+    let t = 2;
+    fill_rect(&mut img, 0, 0, w, t, Rgb([230, 40, 40])); // top: red
+    fill_rect(&mut img, 0, h - t, w, t, Rgb([60, 110, 255])); // bottom: blue
+    fill_rect(&mut img, 0, 0, t, h, Rgb([250, 220, 0])); // left: yellow
+    fill_rect(&mut img, w - t, 0, t, h, Rgb([40, 200, 80])); // right: green
+    img
+}
+
+/// One slice of a tall seamless canvas: a 10 px grid with continuous y labels
+/// every 10 px, no borders and a lighter background, so gaps (dark bands) or
+/// overlaps (short grid squares) at the joins between slots stand out.
+pub fn canvas_slice(w: u32, h: u32, y_offset: u32) -> RgbImage {
+    let mut img = RgbImage::from_pixel(w, h, Rgb([40, 64, 96]));
+    for x in (0..w).step_by(10) {
+        let c = if x.is_multiple_of(50) {
+            Rgb([170, 180, 200])
+        } else {
+            Rgb([80, 104, 136])
+        };
+        fill_rect(&mut img, x, 0, 1, h, c);
+    }
+    for y in 0..h {
+        let v = y + y_offset;
+        if v.is_multiple_of(10) {
+            let c = if v.is_multiple_of(50) {
+                Rgb([170, 180, 200])
+            } else {
+                Rgb([80, 104, 136])
+            };
+            fill_rect(&mut img, 0, y, w, 1, c);
+            if y + 9 < h {
+                draw_text_at(&mut img, &v.to_string(), 30, y + 2, 1, Rgb([255, 255, 255]));
+            }
+        }
+    }
+    img
+}

@@ -14,7 +14,10 @@ mod icon;
 mod import;
 mod instance;
 mod keys;
+mod lhm;
 mod render;
+mod sensors;
+mod side;
 mod tray;
 
 use std::fs::OpenOptions;
@@ -173,6 +176,18 @@ fn main() {
                         .unwrap_or_else(|e| fail(&e.to_string()));
                     println!("wrote {}", path.display());
                 }
+            }
+            if !cfg.side.widgets.is_empty() {
+                // Two samples a moment apart so CPU usage has a delta to work from.
+                let mut sensors = sensors::Sensors::new(std::time::Duration::ZERO);
+                sensors.read();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let readings = sensors.read().clone();
+                println!("readings: {readings:?}");
+                let canvas = side::draw(r.font(), &cfg.side, &readings, side::Now::local());
+                let path = dir.join("side.png");
+                canvas.save(&path).unwrap_or_else(|e| fail(&e.to_string()));
+                println!("wrote {}", path.display());
             }
         }
         "autostart" => match args.get(1).map(String::as_str) {
