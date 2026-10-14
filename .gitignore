@@ -1,0 +1,7 @@
+/target
+*.log
+
+# Personal data: never commit configs, icons or vendor profiles
+config.toml
+/icons/
+*.sdProfile/

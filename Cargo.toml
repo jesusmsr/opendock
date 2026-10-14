@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["app", "crates/ajazz-hid", "tools/probe"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[workspace.dependencies]
+hidapi = { version = "2.6", default-features = false, features = ["windows-native"] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

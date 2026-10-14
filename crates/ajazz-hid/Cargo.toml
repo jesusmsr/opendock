@@ -1,0 +1,9 @@
+[package]
+name = "ajazz-hid"
+description = "Low-level HID protocol for AJAZZ / Mirabox Stream Dock devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hidapi.workspace = true
