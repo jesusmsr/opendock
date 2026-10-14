@@ -6,13 +6,16 @@
 
 mod actions;
 mod audio;
+mod autostart;
 mod config;
 mod deck;
 mod gui;
+mod icon;
 mod import;
 mod instance;
 mod keys;
 mod render;
+mod tray;
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
@@ -30,13 +33,15 @@ USAGE: opendock [--config <file>] [command]
 
 COMMANDS:
   (none)               Open the settings window
-  run                  Run the engine that drives the device (no window)
+  run                  Run the engine that drives the device (tray icon, no window)
   check                Validate the config and print a summary
   import [--profile <dir>] [--force]
                        Create the config from the vendor app's profile
                        (default: the one active on your device)
   preview <dir>        Render every key to PNG files for a quick look
   audio                List audio devices (names for audio_output/audio_input)
+  autostart [on|off|status]
+                       Start the engine when you sign in to Windows
   audio output|input <name>...
                        Set the default device (several names: cycle)
 
@@ -101,6 +106,9 @@ fn main() {
 
     match args.first().map(String::as_str).unwrap_or("settings") {
         "settings" => {
+            if !instance::claim_settings_window() {
+                return; // the open window was brought to the front
+            }
             if let Err(e) = gui::run(config_path) {
                 fail(&format!("cannot open the settings window: {e}"));
             }
@@ -119,7 +127,7 @@ fn main() {
                 }
             };
             log(&format!("using {}", config_path.display()));
-            deck::run(&config_path, cfg, lock);
+            tray::run(config_path, cfg, lock);
         }
         "check" => {
             let cfg = config::Config::load(&config_path).unwrap_or_else(|e| fail(&e));
@@ -167,6 +175,21 @@ fn main() {
                 }
             }
         }
+        "autostart" => match args.get(1).map(String::as_str) {
+            Some("on") => {
+                autostart::set(true, &config_path).unwrap_or_else(|e| fail(&e));
+                println!("opendock will start with Windows");
+            }
+            Some("off") => {
+                autostart::set(false, &config_path).unwrap_or_else(|e| fail(&e));
+                println!("opendock will not start with Windows");
+            }
+            Some("status") | None => {
+                let on = autostart::is_enabled();
+                println!("start with Windows: {}", if on { "on" } else { "off" });
+            }
+            Some(other) => fail(&format!("expected on, off or status, got {other:?}")),
+        },
         "audio" if args.len() > 1 => {
             let flow = match args[1].as_str() {
                 "output" => audio::Flow::Output,

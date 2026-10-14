@@ -26,13 +26,16 @@ Double-click `opendock.exe` to open the **settings window**:
 - the editor sets the icon, an optional "active" icon, title, background and
   action (with a **Test** button); hotkeys can be recorded from the keyboard and
   audio devices are picked from a list of the ones connected
-- pages can be added, renamed, deleted and set as home; brightness is in the top bar
+- pages can be added, renamed, deleted and set as home
+- **⚙ Settings**: start opendock with Windows, deck brightness, title font
 - **Save** (Ctrl+S) writes the config; a running engine applies it immediately
 - **Start/Stop** at the bottom controls the engine; ☰ → *Import from Stream Dock
   AJAZZ* converts the vendor app's profile
 
-The **engine** (`opendock run`) is what drives the deck. It has no window and
-uses about 10 MB of memory.
+The **engine** (`opendock run`) is what drives the deck. It lives in the
+notification area: double-click its icon to open the settings, right-click for
+*Open settings*, *Start with Windows* and *Quit*. It uses about 10-18 MB of memory.
+"Start with Windows" adds a per-user startup entry (no admin rights needed).
 
 From a terminal:
 
@@ -41,6 +44,7 @@ opendock run         # start the engine
 opendock import      # one-time: convert the vendor app's active profile
 opendock check       # validate the config
 opendock preview out # render every key to PNG
+opendock autostart on|off|status
 opendock audio       # list audio devices
 opendock audio output "Headset"   # set the default output from a script
 ```

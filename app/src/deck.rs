@@ -18,6 +18,7 @@ use crate::config::{Action, Config, Key};
 use crate::instance::EngineLock;
 use crate::log;
 use crate::render::Renderer;
+use crate::tray::Status;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// How often the config file and live key state (e.g. audio devices) are checked.
@@ -271,7 +272,12 @@ fn session(dev: &Device, st: &mut State, lock: &EngineLock) -> ajazz_hid::Result
 }
 
 /// Runs until a quit is requested, reconnecting whenever the device goes away.
-pub fn run(path: &Path, cfg: Config, lock: EngineLock) {
+pub fn run(path: &Path, cfg: Config, lock: EngineLock, status: &Status) {
+    let set_status = |s: &str| {
+        if let Ok(mut st) = status.lock() {
+            *st = s.to_string();
+        }
+    };
     let _com = audio::ComGuard::new();
     let mut st = State::new(path, cfg);
     let mut api = loop {
@@ -289,6 +295,7 @@ pub fn run(path: &Path, cfg: Config, lock: EngineLock) {
         match Device::open(&api, None) {
             Ok(dev) => {
                 waiting_logged = false;
+                set_status("deck connected");
                 log(&format!(
                     "connected to {} (packet {} bytes)",
                     dev.serial,
@@ -301,6 +308,7 @@ pub fn run(path: &Path, cfg: Config, lock: EngineLock) {
             }
             Err(e) => {
                 if !waiting_logged {
+                    set_status("waiting for the deck");
                     log(&format!("waiting for device ({e})"));
                     waiting_logged = true;
                 }

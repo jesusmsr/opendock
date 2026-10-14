@@ -20,6 +20,9 @@ pub struct EngineLock {
     quit_event: HANDLE,
 }
 
+// SAFETY: the only field is a Win32 event handle, which any thread may wait on.
+unsafe impl Send for EngineLock {}
+
 impl EngineLock {
     /// Returns None if another engine is already running.
     pub fn acquire() -> Option<Self> {
@@ -72,5 +75,35 @@ pub fn request_quit() -> bool {
         let ok = SetEvent(h) != 0;
         CloseHandle(h);
         ok
+    }
+}
+
+const SETTINGS_MUTEX_NAME: &str = "Local\\opendock-settings";
+/// Title of the settings window, also used to find it from another process.
+pub const SETTINGS_TITLE: &str = "opendock settings";
+
+/// Returns false if a settings window is already open; in that case it is
+/// brought to the front instead.
+pub fn claim_settings_window() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+    let name = wide(SETTINGS_MUTEX_NAME);
+    // SAFETY: valid NUL-terminated strings. The mutex handle is intentionally
+    // never closed so it lives exactly as long as the process.
+    unsafe {
+        CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return true;
+        }
+        let title = wide(SETTINGS_TITLE);
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !hwnd.is_null() {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            SetForegroundWindow(hwnd);
+        }
+        false
     }
 }

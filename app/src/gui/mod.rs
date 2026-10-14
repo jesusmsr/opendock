@@ -17,7 +17,7 @@ use eframe::egui::{
 use crate::audio::{self, Endpoint, Flow};
 use crate::config::{Action, Config, Key, Pos, Run};
 use crate::render::Renderer;
-use crate::{actions, import, instance};
+use crate::{actions, autostart, icon, import, instance};
 use editor::EditorCtx;
 
 const ACCENT: Color32 = Color32::from_rgb(80, 160, 255);
@@ -33,7 +33,12 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
 pub fn run(config_path: PathBuf) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("opendock")
+            .with_title(instance::SETTINGS_TITLE)
+            .with_icon(egui::IconData {
+                rgba: icon::rgba(),
+                width: icon::SIZE,
+                height: icon::SIZE,
+            })
             .with_inner_size([1040.0, 660.0])
             .with_min_inner_size([800.0, 520.0]),
         ..Default::default()
@@ -46,6 +51,7 @@ pub fn run(config_path: PathBuf) -> eframe::Result {
 }
 
 enum Dialog {
+    Settings,
     NewPage(String),
     RenamePage(String),
     DeletePage,
@@ -70,12 +76,15 @@ struct SettingsApp {
     selected: Option<Pos>,
     renderer: Renderer,
     textures: HashMap<u64, TextureHandle>,
+    /// Font the renderer was built with; rebuilt when the config's font changes.
+    renderer_font: Option<PathBuf>,
     drag_from: Option<Pos>,
     outputs: Vec<Endpoint>,
     inputs: Vec<Endpoint>,
     status: Option<Status>,
     dialog: Option<Dialog>,
     engine_running: bool,
+    start_with_windows: bool,
     engine_checked: Instant,
     test_tx: Sender<Result<(), String>>,
     test_rx: Receiver<Result<(), String>>,
@@ -148,12 +157,14 @@ impl SettingsApp {
             saved_toml,
             selected: None,
             textures: HashMap::new(),
+            renderer_font: None,
             drag_from: None,
             outputs: Vec::new(),
             inputs: Vec::new(),
             status,
             dialog: None,
             engine_running: instance::engine_running(),
+            start_with_windows: autostart::is_enabled(),
             engine_checked: Instant::now(),
             test_tx,
             test_rx,
@@ -273,8 +284,14 @@ impl SettingsApp {
 
     /// Background bookkeeping done every frame.
     fn poll(&mut self, ctx: &egui::Context) {
+        if self.cfg.font != self.renderer_font {
+            self.renderer = Renderer::new(self.cfg.font.as_deref(), &self.base_dir);
+            self.renderer_font = self.cfg.font.clone();
+            self.textures.clear();
+        }
         if self.engine_checked.elapsed() >= Duration::from_secs(1) {
             self.engine_running = instance::engine_running();
+            self.start_with_windows = autostart::is_enabled();
             self.engine_checked = Instant::now();
         }
         while let Ok(result) = self.test_rx.try_recv() {
@@ -377,8 +394,9 @@ impl SettingsApp {
                         ui.close();
                     }
                 });
-                ui.add(egui::Slider::new(&mut self.cfg.brightness, 0..=100).suffix(" %"));
-                ui.label("Brightness");
+                if ui.button("⚙ Settings").clicked() {
+                    self.dialog = Some(Dialog::Settings);
+                }
             });
         });
         ui.add_space(4.0);
@@ -636,6 +654,63 @@ impl SettingsApp {
         let modal = egui::Modal::new(Id::new("dialog")).show(ctx, |ui| {
             ui.set_width(380.0);
             match &mut dialog {
+                Dialog::Settings => {
+                    ui.heading("⚙ Settings");
+                    ui.add_space(8.0);
+
+                    ui.label(RichText::new("General").strong());
+                    ui.indent("general", |ui| {
+                        if ui
+                            .checkbox(&mut self.start_with_windows, "Start opendock with Windows")
+                            .changed()
+                        {
+                            if let Err(e) = autostart::set(self.start_with_windows, &self.path) {
+                                self.start_with_windows = !self.start_with_windows;
+                                self.set_status(e, true);
+                            }
+                        }
+                        ui.weak("Runs the engine and its tray icon when you sign in. Applies right away.");
+                    });
+                    ui.add_space(10.0);
+
+                    ui.label(RichText::new("Deck").strong());
+                    ui.indent("deck", |ui| {
+                        egui::Grid::new("deck_settings").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                            ui.label("Brightness");
+                            ui.add(egui::Slider::new(&mut self.cfg.brightness, 0..=100).suffix(" %"));
+                            ui.end_row();
+
+                            ui.label("Title font");
+                            ui.horizontal(|ui| {
+                                let name = self.cfg.font.as_ref().map_or("Segoe UI Bold (default)".to_string(), |f| {
+                                    f.file_name().map_or(f.display().to_string(), |n| n.to_string_lossy().into_owned())
+                                });
+                                ui.label(name);
+                                if ui.button("Choose…").clicked() {
+                                    let picked = rfd::FileDialog::new()
+                                        .set_title("Choose a font for key titles")
+                                        .add_filter("Fonts", &["ttf", "otf"])
+                                        .set_directory(r"C:\Windows\Fonts")
+                                        .pick_file();
+                                    if let Some(f) = picked {
+                                        let rel = f.strip_prefix(&self.base_dir).map(PathBuf::from).unwrap_or(f);
+                                        self.cfg.font = Some(rel);
+                                    }
+                                }
+                                if self.cfg.font.is_some() && ui.button("Default").clicked() {
+                                    self.cfg.font = None;
+                                }
+                            });
+                            ui.end_row();
+                        });
+                        ui.weak("Deck settings are saved with your keys (Save / Ctrl+S).");
+                    });
+                    ui.add_space(10.0);
+                    ui.separator();
+                    if ui.button("Close").clicked() {
+                        keep = false;
+                    }
+                }
                 Dialog::NewPage(name) | Dialog::RenamePage(name) => {
                     ui.heading(if creating { "New page" } else { "Rename page" });
                     let edit = ui.add(egui::TextEdit::singleline(name).hint_text("Page name"));
