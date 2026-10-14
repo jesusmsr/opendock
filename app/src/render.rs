@@ -43,37 +43,49 @@ impl Renderer {
         }
     }
 
-    fn icon_path(&self, key: &Key) -> Option<PathBuf> {
-        key.icon.as_ref().map(|i| self.base_dir.join(i))
+    fn icon_path(&self, key: &Key, active: bool) -> Option<PathBuf> {
+        let icon = if active {
+            key.icon_active.as_ref().or(key.icon.as_ref())
+        } else {
+            key.icon.as_ref()
+        };
+        icon.map(|i| self.base_dir.join(i))
     }
 
-    /// Device-ready JPEG for `key`, cached until the key or its icon file changes.
-    pub fn jpeg(&mut self, key: &Key) -> Vec<u8> {
+    /// Identifies what `key` looks like: only the visual fields (not its
+    /// position or action) plus the icon file's modification time.
+    pub fn look_id(&self, key: &Key, active: bool) -> u64 {
         let mut h = DefaultHasher::new();
-        key.hash(&mut h);
+        (&key.icon, &key.icon_active, &key.title, &key.color).hash(&mut h);
+        (key.title_size, key.title_align, active).hash(&mut h);
         let mtime = self
-            .icon_path(key)
+            .icon_path(key, active)
             .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
         mtime.hash(&mut h);
-        let id = h.finish();
+        h.finish()
+    }
+
+    /// Device-ready JPEG for `key`, cached until its look or icon file changes.
+    pub fn jpeg(&mut self, key: &Key, active: bool) -> Vec<u8> {
+        let id = self.look_id(key, active);
         if let Some(j) = self.cache.get(&id) {
             return j.clone();
         }
-        let jpeg = encode(&self.draw(key));
+        let jpeg = encode(&self.draw(key, active));
         self.cache.insert(id, jpeg.clone());
         jpeg
     }
 
     /// Upright RGB image of the key.
-    pub fn draw(&self, key: &Key) -> RgbImage {
+    pub fn draw(&self, key: &Key, active: bool) -> RgbImage {
         let bg = key
             .color
             .as_deref()
             .and_then(parse_color)
             .unwrap_or(Rgb([0, 0, 0]));
         let mut img = RgbImage::from_pixel(IMAGE_SIZE, IMAGE_SIZE, bg);
-        if let Some(path) = self.icon_path(key) {
+        if let Some(path) = self.icon_path(key, active) {
             match image::open(&path) {
                 Ok(icon) => {
                     let icon = icon.resize(IMAGE_SIZE, IMAGE_SIZE, imageops::FilterType::Lanczos3);
@@ -85,6 +97,9 @@ impl Renderer {
                 }
                 Err(e) => crate::log(&format!("key {}: icon {}: {e}", key.pos, path.display())),
             }
+        }
+        if active && key.icon_active.is_none() {
+            draw_border(&mut img, 5, Rgb([40, 220, 90]));
         }
         if let (Some(font), Some(title)) =
             (&self.font, key.title.as_deref().filter(|t| !t.is_empty()))
@@ -113,6 +128,15 @@ pub fn parse_color(s: &str) -> Option<Rgb<u8>> {
     }
     let v = u32::from_str_radix(hex, 16).ok()?;
     Some(Rgb([(v >> 16) as u8, (v >> 8) as u8, v as u8]))
+}
+
+fn draw_border(img: &mut RgbImage, width: u32, color: Rgb<u8>) {
+    let (w, h) = img.dimensions();
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        if x < width || y < width || x >= w - width || y >= h - width {
+            *p = color;
+        }
+    }
 }
 
 fn blend(dst: &mut RgbImage, src: &RgbaImage, ox: u32, oy: u32) {

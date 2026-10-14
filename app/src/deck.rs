@@ -1,6 +1,9 @@
 //! Device session: connect, draw the current page, dispatch key presses,
 //! keep the connection alive and hot-reload the config.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -9,12 +12,15 @@ use ajazz_hid::akp153e::{self, COLS, ROWS};
 use ajazz_hid::{Device, HidApi};
 
 use crate::actions::{self, Nav};
-use crate::config::{Config, Key};
+use crate::audio::{self, Endpoint, Flow};
+use crate::config::{Action, Config, Key};
+use crate::instance::EngineLock;
 use crate::log;
 use crate::render::Renderer;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
-const RELOAD_CHECK: Duration = Duration::from_secs(1);
+/// How often the config file and live key state (e.g. audio devices) are checked.
+const POLL: Duration = Duration::from_secs(1);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 struct State {
@@ -24,6 +30,44 @@ struct State {
     mtime: Option<SystemTime>,
     /// Page history; the last entry is the visible page.
     stack: Vec<String>,
+    /// What each key id currently shows: hash of the uploaded JPEG, None if cleared.
+    shown: HashMap<u8, Option<u64>>,
+    live: Live,
+}
+
+/// System state that changes what keys look like.
+#[derive(Default)]
+struct Live {
+    outputs: Vec<Endpoint>,
+    inputs: Vec<Endpoint>,
+    default_output: Option<String>,
+    default_input: Option<String>,
+}
+
+impl Live {
+    fn refresh(&mut self, output: bool, input: bool) {
+        if output {
+            self.outputs = audio::list(Flow::Output).unwrap_or_default();
+            self.default_output = audio::default_id(Flow::Output);
+        }
+        if input {
+            self.inputs = audio::list(Flow::Input).unwrap_or_default();
+            self.default_input = audio::default_id(Flow::Input);
+        }
+    }
+
+    /// A single-device audio key is active while its device is the default.
+    fn is_active(&self, key: &Key) -> bool {
+        let (list, default, target) = match &key.action {
+            Some(Action::AudioOutput(t)) => (&self.outputs, &self.default_output, t),
+            Some(Action::AudioInput(t)) => (&self.inputs, &self.default_input, t),
+            _ => return false,
+        };
+        match target.targets().as_slice() {
+            [one] => audio::resolve(list, one).is_some_and(|e| Some(&e.id) == default.as_ref()),
+            _ => false,
+        }
+    }
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -43,6 +87,8 @@ impl State {
             renderer,
             mtime: mtime(path),
             cfg,
+            shown: HashMap::new(),
+            live: Live::default(),
         }
     }
 
@@ -87,6 +133,23 @@ impl State {
         }
     }
 
+    /// Re-reads live state needed by the visible page.
+    fn refresh_live(&mut self) {
+        let keys = self
+            .cfg
+            .pages
+            .get(self.page())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let output = keys
+            .iter()
+            .any(|k| matches!(k.action, Some(Action::AudioOutput(_))));
+        let input = keys
+            .iter()
+            .any(|k| matches!(k.action, Some(Action::AudioInput(_))));
+        self.live.refresh(output, input);
+    }
+
     fn navigate(&mut self, nav: &Nav) {
         match nav {
             Nav::Page(p) if p != self.page() => self.stack.push(p.clone()),
@@ -103,18 +166,38 @@ impl State {
     }
 }
 
-/// Uploads every key of the current page and makes it visible.
+/// Brings the device in line with the current page, uploading only keys
+/// whose image changed.
 fn draw_page(dev: &Device, st: &mut State) -> ajazz_hid::Result<()> {
+    st.refresh_live();
+    let mut changed = false;
     for row in 0..ROWS {
         for col in 0..COLS {
             let id = akp153e::key_id(row, col).expect("in range");
-            match st.key_at(row, col).cloned() {
-                Some(key) => dev.set_key_image(id, &st.renderer.jpeg(&key))?,
+            let jpeg = st.key_at(row, col).cloned().map(|key| {
+                let active = st.live.is_active(&key);
+                st.renderer.jpeg(&key, active)
+            });
+            let hash = jpeg.as_ref().map(|j| {
+                let mut h = DefaultHasher::new();
+                j.hash(&mut h);
+                h.finish()
+            });
+            if st.shown.get(&id) == Some(&hash) {
+                continue;
+            }
+            match &jpeg {
+                Some(j) => dev.set_key_image(id, j)?,
                 None => dev.clear_key(id)?,
             }
+            st.shown.insert(id, hash);
+            changed = true;
         }
     }
-    dev.flush()
+    if changed {
+        dev.flush()?;
+    }
+    Ok(())
 }
 
 fn on_press(st: &mut State, id: u8) -> bool {
@@ -137,12 +220,21 @@ fn on_press(st: &mut State, id: u8) -> bool {
     st.page() != before
 }
 
-fn session(dev: &Device, st: &mut State) -> ajazz_hid::Result<()> {
+/// Drives a connected device until it disconnects (Err) or a quit is
+/// requested (Ok).
+fn session(dev: &Device, st: &mut State, lock: &EngineLock) -> ajazz_hid::Result<()> {
     dev.set_brightness(st.cfg.brightness)?;
+    // A fresh connection shows nothing we know of.
+    st.shown.clear();
     draw_page(dev, st)?;
     let mut last_ping = Instant::now();
     let mut last_check = Instant::now();
     loop {
+        if lock.quit_requested() {
+            // Leave the keys blank rather than showing actions that no longer work.
+            dev.clear_all()?;
+            return dev.flush();
+        }
         if let Some(report) = dev.read(Duration::from_millis(100))? {
             if let Some((id, 1)) = report.key {
                 if on_press(st, id) {
@@ -150,12 +242,13 @@ fn session(dev: &Device, st: &mut State) -> ajazz_hid::Result<()> {
                 }
             }
         }
-        if last_check.elapsed() >= RELOAD_CHECK {
+        if last_check.elapsed() >= POLL {
             last_check = Instant::now();
             if st.reload_if_changed() {
                 dev.set_brightness(st.cfg.brightness)?;
-                draw_page(dev, st)?;
             }
+            // Cheap when nothing changed: only differing keys are uploaded.
+            draw_page(dev, st)?;
         }
         if last_ping.elapsed() >= KEEP_ALIVE {
             last_ping = Instant::now();
@@ -164,8 +257,9 @@ fn session(dev: &Device, st: &mut State) -> ajazz_hid::Result<()> {
     }
 }
 
-/// Runs forever, reconnecting whenever the device goes away.
-pub fn run(path: &Path, cfg: Config) -> ! {
+/// Runs until a quit is requested, reconnecting whenever the device goes away.
+pub fn run(path: &Path, cfg: Config, lock: EngineLock) {
+    let _com = audio::ComGuard::new();
     let mut st = State::new(path, cfg);
     let mut api = loop {
         match HidApi::new() {
@@ -187,8 +281,9 @@ pub fn run(path: &Path, cfg: Config) -> ! {
                     dev.serial,
                     dev.packet_size()
                 ));
-                if let Err(e) = session(&dev, &mut st) {
-                    log(&format!("device disconnected: {e}"));
+                match session(&dev, &mut st, &lock) {
+                    Ok(()) => break,
+                    Err(e) => log(&format!("device disconnected: {e}")),
                 }
             }
             Err(e) => {
@@ -198,9 +293,13 @@ pub fn run(path: &Path, cfg: Config) -> ! {
                 }
             }
         }
+        if lock.quit_requested() {
+            break;
+        }
         thread::sleep(RECONNECT_DELAY);
         if let Err(e) = api.refresh_devices() {
             log(&format!("HID refresh failed: {e}"));
         }
     }
+    log("engine stopped");
 }

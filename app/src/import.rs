@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::config::{Action, Config, Key, Media, Pos, Run};
+use crate::config::{Action, AudioTarget, Config, Key, Media, Pos, Run};
 use crate::keys;
 
 pub struct Report {
@@ -153,7 +153,23 @@ fn convert(action: &Value) -> Result<Action, String> {
             Ok(Action::Multi(out))
         }
         "com.mirabox.streamdock.switchAudio.myaction1" => {
-            Err("audio device switching is not implemented yet".into())
+            let id = s(&settings, "select")
+                .filter(|i| !i.is_empty())
+                .ok_or("audio switch: no device")?;
+            // Prefer the readable name; ids also work but are opaque.
+            let name = settings
+                .get("devices")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|d| s(d, "deviceId") == Some(id))
+                .and_then(|d| s(d, "deviceName"))
+                .unwrap_or(id);
+            let target = AudioTarget::One(name.to_string());
+            Ok(match s(&settings, "device") {
+                Some("input") => Action::AudioInput(target),
+                _ => Action::AudioOutput(target),
+            })
         }
         other => Err(format!(
             "{} ({other}) is not supported",
@@ -241,6 +257,7 @@ pub fn import(profile_dir: &Path, config_dir: &Path) -> Result<Report, String> {
         keys_out.push(Key {
             pos,
             icon,
+            icon_active: None,
             title,
             color: None,
             title_size: None,

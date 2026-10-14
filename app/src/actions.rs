@@ -14,6 +14,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNORMAL};
 
+use crate::audio::{self, Flow};
 use crate::config::{Action, Media, Run};
 use crate::keys;
 
@@ -54,6 +55,8 @@ pub fn execute(action: &Action) -> Result<(), String> {
             key: media_vk(*m),
         }),
         Action::Text(t) => send_text(t),
+        Action::AudioOutput(t) => switch_audio(Flow::Output, &t.targets()),
+        Action::AudioInput(t) => switch_audio(Flow::Input, &t.targets()),
         Action::Delay(ms) => {
             sleep(Duration::from_millis(*ms));
             Ok(())
@@ -61,6 +64,18 @@ pub fn execute(action: &Action) -> Result<(), String> {
         Action::Multi(list) => list.iter().try_for_each(execute),
         Action::Page(_) | Action::Back | Action::Home => Ok(()),
     }
+}
+
+fn switch_audio(flow: Flow, targets: &[String]) -> Result<(), String> {
+    let _com = audio::ComGuard::new();
+    let name = audio::switch(flow, targets)?;
+    let kind = if flow == Flow::Output {
+        "output"
+    } else {
+        "input"
+    };
+    crate::log(&format!("default {kind} device is now {name:?}"));
+    Ok(())
 }
 
 fn media_vk(m: Media) -> u16 {

@@ -37,6 +37,33 @@ fn default_brightness() -> u8 {
     60
 }
 
+impl Default for Config {
+    /// An empty home page: a valid starting point for new users.
+    fn default() -> Self {
+        Config {
+            brightness: default_brightness(),
+            home: default_home(),
+            font: None,
+            pages: HashMap::from([(default_home(), Vec::new())]),
+        }
+    }
+}
+
+impl Key {
+    pub fn empty(pos: Pos) -> Self {
+        Key {
+            pos,
+            icon: None,
+            icon_active: None,
+            title: None,
+            color: None,
+            title_size: None,
+            title_align: None,
+            action: None,
+        }
+    }
+}
+
 fn default_home() -> String {
     "main".into()
 }
@@ -47,6 +74,10 @@ pub struct Key {
     pub pos: Pos,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<PathBuf>,
+    /// Icon shown instead of `icon` while the key is active (e.g. its audio
+    /// device is the current default). Without it, active keys get a green border.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_active: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Background colour as `#rrggbb`.
@@ -121,6 +152,10 @@ pub enum Action {
     Media(Media),
     /// Type text.
     Text(String),
+    /// Make a playback device the default; a list cycles through devices.
+    AudioOutput(AudioTarget),
+    /// Make a recording device the default; a list cycles through devices.
+    AudioInput(AudioTarget),
     /// Go to a page.
     Page(String),
     /// Return to the previous page.
@@ -149,7 +184,36 @@ pub enum Run {
     },
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, Hash)]
+/// Device name (or part of it), device id, or a list of them to cycle through.
+#[derive(Debug, Clone, Deserialize, Serialize, Hash)]
+#[serde(untagged)]
+pub enum AudioTarget {
+    One(String),
+    Cycle(Vec<String>),
+}
+
+impl AudioTarget {
+    pub fn targets(&self) -> Vec<String> {
+        match self {
+            AudioTarget::One(s) => vec![s.clone()],
+            AudioTarget::Cycle(v) => v.clone(),
+        }
+    }
+
+    fn to_inline_toml(&self) -> String {
+        match self {
+            AudioTarget::One(s) => quote(s),
+            AudioTarget::Cycle(v) => {
+                format!(
+                    "[{}]",
+                    v.iter().map(|s| quote(s)).collect::<Vec<_>>().join(", ")
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Media {
     PlayPause,
@@ -210,6 +274,8 @@ impl Action {
                 format!("{{ media = {name} }}")
             }
             Action::Text(t) => format!("{{ text = {} }}", quote(t)),
+            Action::AudioOutput(t) => format!("{{ audio_output = {} }}", t.to_inline_toml()),
+            Action::AudioInput(t) => format!("{{ audio_input = {} }}", t.to_inline_toml()),
             Action::Page(p) => format!("{{ page = {} }}", quote(p)),
             Action::Back => "\"back\"".into(),
             Action::Home => "\"home\"".into(),
@@ -254,6 +320,12 @@ impl Config {
                         quote(&i.to_string_lossy().replace('\\', "/"))
                     );
                 }
+                if let Some(i) = &k.icon_active {
+                    out += &format!(
+                        "icon_active = {}\n",
+                        quote(&i.to_string_lossy().replace('\\', "/"))
+                    );
+                }
                 if let Some(t) = &k.title {
                     out += &format!("title = {}\n", quote(t));
                 }
@@ -282,7 +354,46 @@ impl Config {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    /// Writes the config atomically (temp file + rename), so the running
+    /// engine never reads a half-written file.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        self.validate()?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, self.to_toml()).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Renames a page and every link to it. Returns false if `to` is taken.
+    pub fn rename_page(&mut self, from: &str, to: &str) -> bool {
+        if from == to || self.pages.contains_key(to) {
+            return from == to;
+        }
+        let Some(keys) = self.pages.remove(from) else {
+            return false;
+        };
+        self.pages.insert(to.to_string(), keys);
+        if self.home == from {
+            self.home = to.to_string();
+        }
+        fn relink(a: &mut Action, from: &str, to: &str) {
+            match a {
+                Action::Page(p) if p == from => *p = to.to_string(),
+                Action::Multi(list) => list.iter_mut().for_each(|a| relink(a, from, to)),
+                _ => {}
+            }
+        }
+        for key in self.pages.values_mut().flatten() {
+            if let Some(a) = &mut key.action {
+                relink(a, from, to);
+            }
+        }
+        true
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
         if !self.pages.contains_key(&self.home) {
             return Err(format!(
                 "home page {:?} is not defined under [pages]",
@@ -302,19 +413,22 @@ impl Config {
                     return Err(format!("page {name:?}: pos {} is used twice", k.pos));
                 }
                 if let Some(a) = &k.action {
-                    self.check_pages(name, a)?;
+                    self.check_action(a)
+                        .map_err(|e| format!("page {name:?}, key {}: {e}", k.pos))?;
                 }
             }
         }
         Ok(())
     }
 
-    fn check_pages(&self, page: &str, a: &Action) -> Result<(), String> {
+    /// Checks what can be checked without running the action.
+    fn check_action(&self, a: &Action) -> Result<(), String> {
         match a {
             Action::Page(p) if !self.pages.contains_key(p) => {
-                Err(format!("page {page:?}: links to undefined page {p:?}"))
+                Err(format!("links to undefined page {p:?}"))
             }
-            Action::Multi(list) => list.iter().try_for_each(|a| self.check_pages(page, a)),
+            Action::Hotkey(h) => crate::keys::parse(h).map(|_| ()),
+            Action::Multi(list) => list.iter().try_for_each(|a| self.check_action(a)),
             _ => Ok(()),
         }
     }
@@ -374,6 +488,13 @@ mod tests {
             pos = "3,5"
             title_align = "top"
             action = "back"
+            [[pages.other]]
+            pos = "1,1"
+            icon_active = "icons/on.png"
+            action = { audio_output = ["Headset", "Speakers"] }
+            [[pages.other]]
+            pos = "1,2"
+            action = { audio_input = "Microphone" }
         "#;
         let cfg: Config = toml::from_str(src).unwrap();
         let again: Config = toml::from_str(&cfg.to_toml()).unwrap();
@@ -382,6 +503,28 @@ mod tests {
         assert!(cfg
             .to_toml()
             .contains("action = { multi = [{ hotkey = \"win+d\" }"));
+    }
+
+    #[test]
+    fn rename_page_updates_links_and_home() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [[pages.main]]
+            pos = "1,1"
+            action = { multi = [{ page = "obs" }, "back"] }
+            [[pages.obs]]
+            pos = "1,1"
+            action = { page = "main" }
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.rename_page("main", "home"));
+        assert!(cfg.rename_page("obs", "stream"));
+        assert!(!cfg.rename_page("stream", "home"), "target name is taken");
+        assert_eq!(cfg.home, "home");
+        cfg.validate().unwrap();
+        assert!(cfg.to_toml().contains(r#"{ page = "stream" }"#));
+        assert!(cfg.to_toml().contains(r#"{ page = "home" }"#));
     }
 
     #[test]
