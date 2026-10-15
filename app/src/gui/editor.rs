@@ -13,6 +13,8 @@ use crate::config::{
 };
 use crate::keys;
 
+use super::theme::{self, ERR, OK, WARN};
+
 /// Read-only data the editor needs from the app.
 pub struct EditorCtx<'a> {
     pub pages: &'a [String],
@@ -47,6 +49,7 @@ enum Kind {
     Multi,
 }
 
+/// Action kinds in menu order; the menu draws a separator between groups.
 const KINDS: [(Kind, &str); 12] = [
     (Kind::Run, "Open program / file"),
     (Kind::Url, "Open website"),
@@ -58,9 +61,86 @@ const KINDS: [(Kind, &str); 12] = [
     (Kind::Page, "Go to page"),
     (Kind::Back, "Previous page"),
     (Kind::Home, "Home page"),
-    (Kind::Delay, "Wait"),
     (Kind::Multi, "Multi-step"),
+    (Kind::Delay, "Wait"),
 ];
+
+/// Kinds that start a new group in the menu.
+const GROUP_STARTS: [Kind; 4] = [Kind::Hotkey, Kind::AudioOutput, Kind::Page, Kind::Multi];
+
+/// Lists the kinds in `ui` (minus `skip`); returns the one clicked.
+fn kind_menu(ui: &mut Ui, current: Option<Kind>, skip: Kind) -> Option<Kind> {
+    let mut picked = None;
+    for (k, l) in KINDS {
+        if k == skip {
+            continue;
+        }
+        if GROUP_STARTS.contains(&k) {
+            ui.separator();
+        }
+        if ui.selectable_label(current == Some(k), l).clicked() && current != Some(k) {
+            picked = Some(k);
+        }
+    }
+    picked
+}
+
+/// Short human description of an action, e.g. "Hotkey Ctrl+Shift+M".
+pub fn describe(a: &Action) -> String {
+    let file = |p: &str| {
+        Path::new(p)
+            .file_name()
+            .map_or(p.to_string(), |n| n.to_string_lossy().into_owned())
+    };
+    let audio = |what: &str, t: &AudioTarget| {
+        let list = t.targets();
+        match list.as_slice() {
+            [one] if one.is_empty() => format!("{what}: not set"),
+            [one] => format!("{what}: {one}"),
+            many => format!("{what}: cycle {}", many.join(" / ")),
+        }
+    };
+    match a {
+        Action::Run(Run::Path(p)) | Action::Run(Run::Full { path: p, .. }) if p.is_empty() => {
+            "Open: not set".into()
+        }
+        Action::Run(Run::Path(p)) | Action::Run(Run::Full { path: p, .. }) => {
+            format!("Open {}", file(p))
+        }
+        Action::Url(u) => format!(
+            "Open {}",
+            u.trim_start_matches("https://")
+                .trim_start_matches("http://")
+        ),
+        Action::Hotkey(h) if h.is_empty() => "Hotkey: not set".into(),
+        Action::Hotkey(h) => {
+            let pretty: Vec<String> = h
+                .split('+')
+                .map(|p| {
+                    let mut c = p.chars();
+                    c.next()
+                        .map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+                })
+                .collect();
+            format!("Hotkey {}", pretty.join("+"))
+        }
+        Action::Media(m) => MEDIA
+            .iter()
+            .find(|(x, _)| x == m)
+            .map_or("Media key".into(), |(_, l)| l.to_string()),
+        Action::Text(_) => "Type text".into(),
+        Action::AudioOutput(t) => audio("Output", t),
+        Action::AudioInput(t) => audio("Microphone", t),
+        Action::Page(p) => format!("Go to page \"{p}\""),
+        Action::Back => "Previous page".into(),
+        Action::Home => "Home page".into(),
+        Action::Delay(ms) => format!("Wait {ms} ms"),
+        Action::Multi(steps) => match steps.len() {
+            1 => "1 step".into(),
+            n => format!("{n} steps"),
+        },
+    }
+}
 
 const MEDIA: [(Media, &str); 7] = [
     (Media::PlayPause, "Play / Pause"),
@@ -113,33 +193,43 @@ fn new_action(k: Kind, ctx: &EditorCtx) -> Action {
 /// The whole inspector for `key`.
 pub fn key_ui(ui: &mut Ui, key: &mut Key, ctx: &EditorCtx) -> Requests {
     let mut req = Requests::default();
+    // Header: what the key does, with the key-wide commands next to it.
     ui.horizontal(|ui| {
+        let title = match &key.action {
+            Some(a) => describe(a),
+            None if key.icon.is_none() && key.title.is_none() => "Empty key".into(),
+            None => "No action".into(),
+        };
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .button("🗑 Clear")
-                .on_hover_text("Remove everything from this key")
-                .clicked()
-            {
+            if theme::icon_button(ui, true, "🗑", "Clear this key (Del)").clicked() {
                 req.clear = true;
             }
             let test = ui.add_enabled(key.action.is_some(), egui::Button::new("▶ Test"));
-            if test.on_hover_text("Run this key's action now").clicked() {
+            if test
+                .on_hover_text("Run this key's action now")
+                .on_disabled_hover_text("Choose an action first")
+                .clicked()
+            {
                 req.test = key.action.clone();
             }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(title).family(theme::semibold()).size(16.0))
+                        .truncate(),
+                );
+            });
         });
     });
-    ui.separator();
+    ui.add_space(12.0);
 
-    egui::CollapsingHeader::new(RichText::new("Appearance").strong())
-        .default_open(true)
-        .show(ui, |ui| appearance_ui(ui, key, ctx, &mut req));
-    ui.add_space(6.0);
-    egui::CollapsingHeader::new(RichText::new("Action").strong())
-        .default_open(true)
-        .show(ui, |ui| {
-            let id = Id::new(("action", key.pos.row, key.pos.col));
-            top_action_ui(ui, &mut key.action, ctx, id, &mut req);
-        });
+    theme::section(ui, "Action");
+    theme::card(ui, |ui| {
+        let id = Id::new(("action", key.pos.row, key.pos.col));
+        top_action_ui(ui, &mut key.action, ctx, id, &mut req);
+    });
+    ui.add_space(14.0);
+    theme::section(ui, "Appearance");
+    theme::card(ui, |ui| appearance_ui(ui, key, ctx, &mut req));
     req
 }
 
@@ -147,22 +237,23 @@ fn appearance_ui(ui: &mut Ui, key: &mut Key, ctx: &EditorCtx, req: &mut Requests
     // Normal and active icon side by side, so the two looks are easy to compare.
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label("Icon");
+            ui.label(RichText::new("Icon").color(theme::TEXT_WEAK));
             icon_field(ui, &mut key.icon, ctx, req);
         });
         ui.add_space(18.0);
         ui.vertical(|ui| {
-            ui.label("Active icon").on_hover_text(
-                "Shown while the key is active, e.g. when its audio device is the default. \
+            ui.label(RichText::new("Active icon  ⓘ").color(theme::TEXT_WEAK))
+                .on_hover_text(
+                    "Shown while the key is active, e.g. when its audio device is the default. \
                  Without it, active keys get a green border.",
-            );
+                );
             icon_field(ui, &mut key.icon_active, ctx, req);
         });
     });
     ui.add_space(8.0);
     egui::Grid::new("appearance")
         .num_columns(2)
-        .spacing([8.0, 6.0])
+        .spacing([12.0, 8.0])
         .show(ui, |ui| {
             ui.label("Title");
             let mut title = key.title.clone().unwrap_or_default();
@@ -206,17 +297,24 @@ fn appearance_ui(ui: &mut Ui, key: &mut Key, ctx: &EditorCtx, req: &mut Requests
 
             ui.label("Background");
             ui.horizontal(|ui| {
-                let mut on = key.color.is_some();
-                if ui.checkbox(&mut on, "").changed() {
-                    key.color = on.then(|| "#202020".to_string());
+                let mut rgb = key
+                    .color
+                    .as_deref()
+                    .and_then(crate::render::parse_color)
+                    .map_or([0, 0, 0], |p| p.0);
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    key.color = Some(format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]));
                 }
-                if let Some(c) = &mut key.color {
-                    let mut rgb = crate::render::parse_color(c).map_or([32, 32, 32], |p| p.0);
-                    if ui.color_edit_button_srgb(&mut rgb).changed() {
-                        *c = format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]);
+                if key.color.is_some() {
+                    if ui
+                        .small_button("Reset")
+                        .on_hover_text("Back to black")
+                        .clicked()
+                    {
+                        key.color = None;
                     }
                 } else {
-                    ui.weak("black");
+                    ui.weak("Black");
                 }
             });
             ui.end_row();
@@ -280,7 +378,7 @@ fn icon_field(ui: &mut Ui, icon: &mut Option<PathBuf>, ctx: &EditorCtx, req: &mu
     ui.horizontal(|ui| {
         let (rect, resp) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::click());
         let painter = ui.painter();
-        painter.rect_filled(rect, 8.0, Color32::from_gray(30));
+        painter.rect_filled(rect, 8.0, theme::FIELD);
         let path = icon.as_ref().map(|p| ctx.base_dir.join(p));
         match path.as_deref().map(|p| thumbnail(ui, p)) {
             Some(Some(tex)) => {
@@ -302,7 +400,7 @@ fn icon_field(ui: &mut Ui, icon: &mut Option<PathBuf>, ctx: &EditorCtx, req: &mu
                     egui::Align2::CENTER_CENTER,
                     "⚠",
                     egui::FontId::proportional(20.0),
-                    Color32::from_rgb(230, 90, 80),
+                    ERR,
                 );
             }
             None => {
@@ -311,14 +409,14 @@ fn icon_field(ui: &mut Ui, icon: &mut Option<PathBuf>, ctx: &EditorCtx, req: &mu
                     egui::Align2::CENTER_CENTER,
                     "+",
                     egui::FontId::proportional(24.0),
-                    Color32::from_gray(110),
+                    theme::TEXT_FAINT,
                 );
             }
         }
         let stroke = if resp.hovered() {
-            Stroke::new(1.5, Color32::from_gray(160))
+            Stroke::new(1.5, Color32::from_gray(150))
         } else {
-            Stroke::new(1.0, Color32::from_gray(60))
+            Stroke::new(1.0, theme::BORDER)
         };
         painter.rect_stroke(rect, 8.0, stroke, StrokeKind::Inside);
         let hover = match &path {
@@ -354,7 +452,7 @@ Click to choose another image",
                 }
             }
         }
-        if icon.is_some() && ui.small_button("🗙").on_hover_text("Remove").clicked() {
+        if icon.is_some() && theme::icon_button(ui, true, "🗙", "Remove the image").clicked() {
             *icon = None;
         }
     });
@@ -369,23 +467,20 @@ fn top_action_ui(
 ) {
     let current = action.as_ref().map(kind);
     ComboBox::from_id_salt(id.with("kind"))
-        .width(220.0)
+        .width(ui.available_width().min(260.0))
+        .height(600.0)
         .selected_text(current.map_or("Nothing", label))
         .show_ui(ui, |ui| {
             if ui.selectable_label(current.is_none(), "Nothing").clicked() {
                 *action = None;
             }
-            for (k, l) in KINDS {
-                if k == Kind::Delay {
-                    continue; // only meaningful inside a multi-step action
-                }
-                if ui.selectable_label(current == Some(k), l).clicked() && current != Some(k) {
-                    *action = Some(new_action(k, ctx));
-                }
+            // Wait is only meaningful inside a multi-step action.
+            if let Some(k) = kind_menu(ui, current, Kind::Delay) {
+                *action = Some(new_action(k, ctx));
             }
         });
     if let Some(a) = action {
-        ui.add_space(4.0);
+        ui.add_space(8.0);
         action_ui(ui, a, ctx, id, req);
     }
 }
@@ -395,14 +490,11 @@ fn kind_combo(ui: &mut Ui, a: &mut Action, ctx: &EditorCtx, id: Id) {
     ComboBox::from_id_salt(id.with("kind"))
         .width(180.0)
         .selected_text(label(current))
+        .height(600.0)
         .show_ui(ui, |ui| {
-            for (k, l) in KINDS {
-                if k == Kind::Multi {
-                    continue; // keep steps flat
-                }
-                if ui.selectable_label(current == k, l).clicked() && current != k {
-                    *a = new_action(k, ctx);
-                }
+            // Keep steps flat: no multi-step inside a multi-step.
+            if let Some(k) = kind_menu(ui, Some(current), Kind::Multi) {
+                *a = new_action(k, ctx);
             }
         });
 }
@@ -469,24 +561,14 @@ fn multi_ui(ui: &mut Ui, steps: &mut Vec<Action>, ctx: &EditorCtx, id: Id, req: 
     let n = steps.len();
     for (i, step) in steps.iter_mut().enumerate() {
         let sid = id.with(("step", i));
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        step_frame(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{}.", i + 1)).strong());
+                ui.label(RichText::new(format!("{}", i + 1)).color(theme::TEXT_FAINT));
                 kind_combo(ui, step, ctx, sid);
-                if ui
-                    .add_enabled(i > 0, egui::Button::new("⬆").small())
-                    .clicked()
-                {
-                    swap = Some((i, i - 1));
-                }
-                if ui
-                    .add_enabled(i + 1 < n, egui::Button::new("⬇").small())
-                    .clicked()
-                {
-                    swap = Some((i, i + 1));
-                }
-                if ui.small_button("🗙").clicked() {
-                    remove = Some(i);
+                match reorder_buttons(ui, i, n, "step") {
+                    Some(Reorder::Swap(a, b)) => swap = Some((a, b)),
+                    Some(Reorder::Remove(a)) => remove = Some(a),
+                    None => {}
                 }
             });
             action_ui(ui, step, ctx, sid, req);
@@ -506,6 +588,42 @@ fn multi_ui(ui: &mut Ui, steps: &mut Vec<Action>, ctx: &EditorCtx, id: Id, req: 
             steps.push(Action::Delay(200));
         }
     });
+}
+
+enum Reorder {
+    Swap(usize, usize),
+    Remove(usize),
+}
+
+/// Up / down / remove buttons for item `i` of `n` in a list.
+fn reorder_buttons(ui: &mut Ui, i: usize, n: usize, what: &str) -> Option<Reorder> {
+    let mut out = None;
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if theme::icon_button(ui, true, "🗙", &format!("Remove this {what}")).clicked() {
+            out = Some(Reorder::Remove(i));
+        }
+        if theme::icon_button(ui, i + 1 < n, "⬇", "Move down").clicked() {
+            out = Some(Reorder::Swap(i, i + 1));
+        }
+        if theme::icon_button(ui, i > 0, "⬆", "Move up").clicked() {
+            out = Some(Reorder::Swap(i, i - 1));
+        }
+    });
+    out
+}
+
+/// The box around one step of a multi-step action or one widget.
+fn step_frame(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .fill(theme::FIELD)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(6)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        });
+    ui.add_space(6.0);
 }
 
 fn run_ui(ui: &mut Ui, run: &mut Run) {
@@ -668,7 +786,7 @@ fn hotkey_ui(ui: &mut Ui, s: &mut String, id: Id) {
 
     *s = join_hotkey(mods, &key);
     if let Err(e) = keys::parse(s) {
-        ui.colored_label(Color32::from_rgb(230, 90, 80), e);
+        ui.colored_label(ERR, e);
     }
 }
 
@@ -680,9 +798,10 @@ fn audio_ui(ui: &mut Ui, target: &mut AudioTarget, devices: &[Endpoint], req: &m
             ui.add(
                 egui::TextEdit::singleline(entry)
                     .hint_text("device name or part of it")
-                    .desired_width(200.0),
+                    .desired_width(ui.available_width() - 70.0),
             );
             ui.menu_button("⏷", |ui| {
+                ui.set_min_width(220.0);
                 for d in devices {
                     if ui.button(&d.name).clicked() {
                         *entry = d.name.clone();
@@ -693,19 +812,16 @@ fn audio_ui(ui: &mut Ui, target: &mut AudioTarget, devices: &[Endpoint], req: &m
                     ui.weak("No devices found");
                 }
             });
-            if i > 0 && ui.small_button("🗙").clicked() {
+            if i > 0 && theme::icon_button(ui, true, "🗙", "Remove from the cycle").clicked() {
                 remove = Some(i);
             }
         });
         match audio::resolve(devices, entry) {
             Some(d) if !entry.is_empty() => {
-                ui.colored_label(Color32::from_rgb(90, 200, 120), format!("✔ {}", d.name));
+                ui.colored_label(OK, format!("✔ {}", d.name));
             }
             _ => {
-                ui.colored_label(
-                    Color32::from_rgb(230, 90, 80),
-                    "No matching device connected",
-                );
+                ui.colored_label(ERR, "No matching device connected");
             }
         }
     }
@@ -755,17 +871,25 @@ fn widget_label(k: WidgetKind) -> &'static str {
 
 /// Editor for the small screen: an ordered list of up to four widgets.
 pub fn side_ui(ui: &mut Ui, side: &mut Side, cpu_temp_available: bool) {
-    ui.label(RichText::new("Small screen").strong());
-    ui.weak("Widgets are stacked from top to bottom and share the screen equally.");
-    ui.add_space(6.0);
+    ui.label(
+        RichText::new("Small screen")
+            .family(theme::semibold())
+            .size(16.0),
+    );
+    theme::hint(
+        ui,
+        "Up to four widgets, stacked top to bottom. They share the screen equally.",
+    );
+    ui.add_space(12.0);
+    theme::section(ui, "Widgets");
 
     let n = side.widgets.len();
     let mut swap = None;
     let mut remove = None;
     for (i, w) in side.widgets.iter_mut().enumerate() {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        step_frame(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{}.", i + 1)).strong());
+                ui.label(RichText::new(format!("{}", i + 1)).color(theme::TEXT_FAINT));
                 ComboBox::from_id_salt(("widget", i))
                     .width(170.0)
                     .selected_text(widget_label(w.kind))
@@ -776,36 +900,53 @@ pub fn side_ui(ui: &mut Ui, side: &mut Side, cpu_temp_available: bool) {
                             }
                         }
                     });
-                if ui.add_enabled(i > 0, egui::Button::new("⬆").small()).clicked() {
-                    swap = Some((i, i - 1));
-                }
-                if ui.add_enabled(i + 1 < n, egui::Button::new("⬇").small()).clicked() {
-                    swap = Some((i, i + 1));
-                }
-                if ui.small_button("🗙").clicked() {
-                    remove = Some(i);
+                match reorder_buttons(ui, i, n, "widget") {
+                    Some(Reorder::Swap(a, b)) => swap = Some((a, b)),
+                    Some(Reorder::Remove(a)) => remove = Some(a),
+                    None => {}
                 }
             });
-            egui::Grid::new(("widget_fields", i)).num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
-                if w.kind == WidgetKind::Text {
-                    ui.label("Text");
-                    let mut text = w.text.clone().unwrap_or_default();
-                    if ui.add(egui::TextEdit::multiline(&mut text).desired_rows(2).desired_width(180.0)).changed() {
-                        w.text = (!text.is_empty()).then_some(text);
+            egui::Grid::new(("widget_fields", i))
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    if w.kind == WidgetKind::Text {
+                        ui.label("Text");
+                        let mut text = w.text.clone().unwrap_or_default();
+                        if ui
+                            .add(
+                                egui::TextEdit::multiline(&mut text)
+                                    .desired_rows(2)
+                                    .desired_width(180.0),
+                            )
+                            .changed()
+                        {
+                            w.text = (!text.is_empty()).then_some(text);
+                        }
+                        ui.end_row();
+                    }
+                    ui.label("Caption");
+                    let mut label = w.label.clone().unwrap_or_default();
+                    let hint = if w.kind == WidgetKind::Text {
+                        "none"
+                    } else {
+                        "default"
+                    };
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut label)
+                                .hint_text(hint)
+                                .desired_width(180.0),
+                        )
+                        .changed()
+                    {
+                        w.label = (!label.is_empty()).then_some(label);
                     }
                     ui.end_row();
-                }
-                ui.label("Caption");
-                let mut label = w.label.clone().unwrap_or_default();
-                let hint = if w.kind == WidgetKind::Text { "none" } else { "default" };
-                if ui.add(egui::TextEdit::singleline(&mut label).hint_text(hint).desired_width(180.0)).changed() {
-                    w.label = (!label.is_empty()).then_some(label);
-                }
-                ui.end_row();
-            });
+                });
             if w.kind == WidgetKind::CpuTemp && !cpu_temp_available {
                 ui.colored_label(
-                    Color32::from_rgb(240, 190, 80),
+                    WARN,
                     "CPU temperature needs LibreHardwareMonitor: set it up in ⚙ Settings > Sensors.",
                 );
             }
@@ -826,6 +967,9 @@ pub fn side_ui(ui: &mut Ui, side: &mut Side, cpu_temp_available: bool) {
         side.widgets.push(Widget::new(WidgetKind::Clock));
     }
     if side.widgets.is_empty() {
-        ui.weak("No widgets: the small screen stays dark.");
+        theme::hint(
+            ui,
+            "No widgets yet, so the small screen stays dark. Add a clock or a sensor.",
+        );
     }
 }

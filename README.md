@@ -1,135 +1,53 @@
 # opendock
 
-A lightweight controller for the AJAZZ AKP153E (Mirabox 293S V3) stream deck,
-replacing the vendor "Stream Dock AJAZZ" app.
+A lightweight replacement for the vendor "Stream Dock AJAZZ" app, for the
+AJAZZ AKP153E (Mirabox 293S V3) stream deck on Windows.
 
-| | Vendor app | opendock |
-|---|---|---|
-| Processes | 20 | 1 |
-| RAM | ~900 MB | ~10 MB (engine) |
-| Install size | ~950 MB | ~9 MB |
+Original software was hard to find and worked not so well so I decided to make my own.
 
-## Layout
+It is one small program with a settings window and a tray icon: the engine that
+drives the deck uses about 10 MB of memory, against ~900 MB and 20 processes
+for the vendor app.
 
-- `app/`: the `opendock` program
-- `crates/ajazz-hid/`: the device's USB protocol, layout and image format
-- `tools/probe/`: hardware test tool (test patterns, key event logging)
+## Quickstart
 
-## Usage
-
-Quit the vendor app first: only one program can drive the device.
-
-Double-click `opendock.exe` to open the **settings window**:
-
-- the 3x5 grid previews your keys exactly as the deck draws them; click one to
-  edit it, drag to move or swap
-- the editor sets the icon, an optional "active" icon, title, background and
-  action (with a **Test** button); hotkeys can be recorded from the keyboard and
-  audio devices are picked from a list of the ones connected
-- pages can be added, renamed, deleted and set as home
-- the **small screen** preview sits right of the keys (live values); click it to
-  choose up to 4 stacked widgets: CPU/GPU temperature, CPU/GPU usage, VRAM, RAM,
-  clock, date or text
-- **⚙ Settings**: start opendock with Windows, sensors, deck brightness, title font
-- **Save** (Ctrl+S) writes the config; a running engine applies it immediately
-- **Start/Stop** at the bottom controls the engine; ☰ → *Import from Stream Dock
-  AJAZZ* converts the vendor app's profile
-
-The **engine** (`opendock run`) is what drives the deck. It lives in the
-notification area: double-click its icon to open the settings, right-click for
-*Open settings*, *Start with Windows* and *Quit*. It uses about 10-18 MB of memory.
-"Start with Windows" adds a per-user startup entry (no admin rights needed).
-
-From a terminal:
+You need Rust (MSVC toolchain) and the Visual Studio C++ Build Tools.
 
 ```
-opendock run         # start the engine
-opendock import      # one-time: convert the vendor app's active profile
-opendock check       # validate the config
-opendock preview out # render every key to PNG
-opendock autostart on|off|status
-opendock audio       # list audio devices
-opendock audio output "Headset"   # set the default output from a script
+cargo build --release
 ```
 
-The config is `%APPDATA%\opendock\config.toml` (override with `--config <file>`).
-The log is `opendock.log` next to it.
+1. Quit the vendor app. Only one program can drive the deck at a time.
+2. Run `target\release\opendock.exe` to open the settings window.
+3. Optional: in the ☰ menu, choose *Import from Stream Dock AJAZZ* to convert
+   your existing profile.
+4. Click a key to set its icon, title and action, then press **Save** (Ctrl+S).
+5. Press **Start** to run the engine. It stays in the notification area and
+   applies every change you save.
 
-## Config
+Turn on *Start with Windows* in ⚙ Settings or in the tray menu to have it
+running at sign-in.
 
-```toml
-brightness = 60          # 0-100
-home = "main"            # first page shown
-# font = "C:/Windows/Fonts/segoeuib.ttf"
+The config is `%APPDATA%\opendock\config.toml`, with the log next to it.
 
-[[pages.main]]
-pos = "1,1"              # row,col from the top-left, 1-based (3 rows x 5 cols)
-icon = "icons/game.png"  # relative to the config folder; png or jpg
-icon_active = "icons/game-on.png"  # optional; shown while the key is active
-title = "Gaming"         # optional; "\n" for a second line
-color = "#202040"        # optional background
-title_size = 16          # optional
-title_align = "bottom"   # top | middle | bottom
-action = { run = "C:/scripts/gaming-mode.bat" }
-```
+## Features
 
-Actions:
-
-| Action | Example |
-|---|---|
-| Run a program, script, file or folder | `{ run = "C:/tools/app.exe" }` |
-| ...with options | `{ run = { path = "x.bat", args = "-q", cwd = "C:/", hidden = true } }` |
-| Open a URL | `{ url = "https://example.com" }` |
-| Hotkey | `{ hotkey = "ctrl+shift+esc" }`, `{ hotkey = "win+numminus" }` |
-| Media key | `{ media = "play_pause" }`: `next`, `previous`, `stop`, `mute`, `volume_up`, `volume_down` |
-| Type text | `{ text = "Hello!" }` |
-| Default audio output | `{ audio_output = "Headset" }` |
-| Cycle audio outputs | `{ audio_output = ["Headset", "Speakers"] }` |
-| Default microphone | `{ audio_input = "Webcam" }` |
-| Go to a page | `{ page = "obs" }` |
-| Previous page / home page | `"back"`, `"home"` |
-| Several steps | `{ multi = [{ hotkey = "win+e" }, { delay = 800 }, { hotkey = "ctrl+e" }] }` |
-
-Audio devices are matched by exact id, then exact name, then any part of the
-name (case-insensitive); `opendock audio` lists the names. A key that selects a
-single device is **active** while that device is the default: it shows
-`icon_active` if set, otherwise a green border. Switching sets the device for
-all roles (media, games and calls).
-
-Small screen (90x394 px, drawn as one canvas):
-
-```toml
-[side]
-widgets = [
-    { kind = "cpu_temp" },
-    { kind = "gpu_temp" },
-    { kind = "gpu_usage", label = "GPU" },
-]
-```
-
-Kinds: `cpu_temp`, `cpu_usage`, `gpu_temp`, `gpu_usage`, `gpu_memory`, `ram`,
-`clock`, `date`, `text` (with `text = "..."`).
-
-GPU values come from the NVIDIA driver, CPU usage and RAM from Windows; none
-need admin rights. **CPU temperature** needs [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor):
-⚙ Settings → Sensors can install it (with the PawnIO driver it uses) and start it
-at sign-in, after one administrator prompt. opendock reads it from LHM's web
-server on `127.0.0.1:8085`, so an LHM you run yourself with the web server
-enabled works too.
-
-Hotkey names: letters, digits, `f1`-`f24`, `esc`, `enter`, `tab`, `space`,
-`backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`,
-`up`/`down`/`left`/`right`, `printscreen`, `num0`-`num9`, `numplus`,
-`numminus`, `nummultiply`, `numdivide`, `numdecimal`, `period`, `comma`,
-`minus`, `plus`, `slash`, `semicolon`, `quote`, `backquote`, `lbracket`,
-`rbracket`, `backslash`, or `vk:0xNN` for any other virtual-key code.
-Modifiers: `ctrl`, `shift`, `alt`, `win`.
-
-## Building
-
-Needs Rust (MSVC toolchain) and the Visual Studio C++ Build Tools.
-
-```
-cargo build --release   # target/release/opendock.exe
-cargo test --workspace
-```
+- **Visual editor**: a live 3x5 preview of the deck; drag to move or swap
+  keys, copy and paste, undo and redo, and a Test button for every action
+- **Pages**: any number of pages, with actions to go to a page, back or home
+- **Actions**: run programs, scripts, files or folders, open URLs, send
+  hotkeys (recorded from the keyboard), media keys and typed text, and chain
+  several steps with delays
+- **Audio switching**: set or cycle the default output or microphone; the key
+  shows an active icon (or a green border) while its device is the default
+- **Small screen widgets**: up to 4 stacked widgets for CPU and GPU
+  temperature and usage, VRAM, RAM, clock, date or custom text
+- **Icons and layout**: png and jpg icons with a separate active icon, titles,
+  background colours, font choice and brightness
+- **Import**: converts the vendor app's profile, including its small-screen
+  widgets
+- **Always on**: one instance of the engine and one settings window, an
+  autostart entry that needs no admin rights, and automatic reconnection when
+  the deck is unplugged
+- **Command line**: `run`, `check`, `import`, `preview`, `audio` and
+  `autostart` for scripting

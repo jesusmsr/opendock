@@ -2,6 +2,7 @@
 //! saved file by itself, so the deck updates without restarting anything.
 
 mod editor;
+mod theme;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use ajazz_hid::akp153e::{COLS, IMAGE_SIZE, ROWS};
 use eframe::egui::{
-    self, Color32, ColorImage, ComboBox, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
-    TextureHandle, TextureOptions, Vec2,
+    self, Color32, ColorImage, Id, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle,
+    TextureOptions, Vec2,
 };
 
 use crate::audio::{self, Endpoint, Flow};
@@ -21,15 +22,13 @@ use crate::sensors::{Readings, Sensors};
 use crate::side;
 use crate::{actions, autostart, icon, import, instance, lhm};
 use editor::EditorCtx;
+use theme::{ACCENT, ERR, OK, WARN};
 
-const ACCENT: Color32 = Color32::from_rgb(80, 160, 255);
-const OK: Color32 = Color32::from_rgb(90, 200, 120);
-const ERR: Color32 = Color32::from_rgb(230, 90, 80);
 const FULL_UV: Rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
 
 fn status_dot(ui: &mut egui::Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-    ui.painter().circle_filled(rect.center(), 5.0, color);
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
 pub fn run(config_path: PathBuf) -> eframe::Result {
@@ -48,7 +47,10 @@ pub fn run(config_path: PathBuf) -> eframe::Result {
     eframe::run_native(
         "opendock",
         options,
-        Box::new(|_cc| Ok(Box::new(SettingsApp::new(config_path)))),
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(SettingsApp::new(config_path)))
+        }),
     )
 }
 
@@ -108,6 +110,15 @@ struct SettingsApp {
     test_tx: Sender<Result<(), String>>,
     test_rx: Receiver<Result<(), String>>,
     allow_close: bool,
+    /// Undo history as `to_toml()` snapshots: `undo` holds older states,
+    /// `redo` the ones undone, `snapshot` the last committed state.
+    undo: Vec<String>,
+    redo: Vec<String>,
+    snapshot: String,
+    /// A change not yet committed to the history (debounced while typing).
+    pending: Option<(String, Instant)>,
+    /// The last copied key.
+    clip: Option<Key>,
 }
 
 fn is_blank(k: &Key) -> bool {
@@ -195,7 +206,13 @@ impl SettingsApp {
             test_tx,
             test_rx,
             allow_close: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            snapshot: String::new(),
+            pending: None,
+            clip: None,
         };
+        app.snapshot = app.cfg.to_toml();
         app.refresh_audio();
         app
     }
@@ -273,10 +290,10 @@ impl SettingsApp {
 
     /// The Sensors section of the Settings dialog.
     fn sensors_settings(&mut self, ui: &mut egui::Ui) {
-        ui.weak("GPU, CPU usage and RAM are read by opendock directly.");
+        theme::hint(ui, "GPU, CPU usage and RAM are read by opendock directly.");
         let cpu = self.readings.cpu_temp;
         ui.horizontal(|ui| {
-            status_dot(ui, if cpu.is_some() { OK } else { Color32::GRAY });
+            status_dot(ui, if cpu.is_some() { OK } else { theme::TEXT_FAINT });
             ui.label(match cpu {
                 Some(t) => format!("CPU temperature: {t:.0}°"),
                 None => "CPU temperature: not available".to_string(),
@@ -306,10 +323,7 @@ impl SettingsApp {
             parts.push(if st.running { "running" } else { "not running" });
             ui.label(parts.join(" · "));
             if st.running && !st.cpu_temp {
-                ui.colored_label(
-                    Color32::from_rgb(240, 190, 80),
-                    "It runs, but reports no CPU temperature yet.",
-                );
+                ui.colored_label(WARN, "It runs, but reports no CPU temperature yet.");
             }
             ui.horizontal(|ui| {
                 if !st.autostart
@@ -328,10 +342,14 @@ impl SettingsApp {
             ui.label("A LibreHardwareMonitor you run yourself is providing sensors.");
         } else {
             ui.label("CPU temperature needs LibreHardwareMonitor (free, open source).");
-            if ui.button("Install LibreHardwareMonitor").clicked() {
+            if ui
+                .add(theme::primary("Install LibreHardwareMonitor"))
+                .clicked()
+            {
                 self.run_lhm_job(true);
             }
-            ui.weak(
+            theme::hint(
+                ui,
                 "Downloads LHM and the PawnIO driver it uses from their official GitHub releases, and starts LHM minimized at sign-in. Windows asks for administrator permission once.",
             );
         }
@@ -504,137 +522,404 @@ impl SettingsApp {
         }
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.heading(RichText::new("opendock").strong());
-            ui.separator();
-            ui.label("Page");
-            let pages = self.sorted_pages();
-            let label = |p: &str, home: &str| {
-                if p == home {
-                    format!("🏠 {p}")
-                } else {
-                    p.to_string()
-                }
-            };
-            ComboBox::from_id_salt("page")
-                .width(160.0)
-                .selected_text(label(&self.page, &self.cfg.home))
-                .show_ui(ui, |ui| {
-                    for p in &pages {
-                        if ui
-                            .selectable_label(*p == self.page, label(p, &self.cfg.home))
-                            .clicked()
-                        {
-                            self.page = p.clone();
-                            self.selected = None;
-                        }
-                    }
-                });
-            if ui.button("➕").on_hover_text("New page").clicked() {
-                self.dialog = Some(Dialog::NewPage(String::new()));
-            }
-            if ui.button("✏").on_hover_text("Rename page").clicked() {
-                self.dialog = Some(Dialog::RenamePage(self.page.clone()));
-            }
-            let not_home = self.page != self.cfg.home;
-            if ui
-                .add_enabled(not_home, egui::Button::new("🗑"))
-                .on_hover_text("Delete page")
-                .clicked()
-            {
-                self.dialog = Some(Dialog::DeletePage);
-            }
-            if ui
-                .add_enabled(not_home, egui::Button::new("🏠"))
-                .on_hover_text("Make this the home page (shown at start)")
-                .clicked()
-            {
-                self.cfg.home = self.page.clone();
-            }
+    // --- undo / redo ---
 
+    /// Commits edits to the undo history once they settle, so typing a word
+    /// is one step rather than one per letter.
+    fn track_history(&mut self, ctx: &egui::Context) {
+        let current = self.cfg.to_toml();
+        if current == self.snapshot {
+            self.pending = None;
+            return;
+        }
+        match &self.pending {
+            Some((t, at)) if *t == current => {
+                if at.elapsed() >= Duration::from_millis(600) {
+                    self.commit(current);
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(650));
+                }
+            }
+            _ => {
+                self.pending = Some((current, Instant::now()));
+                ctx.request_repaint_after(Duration::from_millis(650));
+            }
+        }
+    }
+
+    fn commit(&mut self, current: String) {
+        let old = std::mem::replace(&mut self.snapshot, current);
+        self.undo.push(old);
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.pending = None;
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.undo.is_empty() || self.pending.is_some()
+    }
+
+    fn undo(&mut self) {
+        let current = self.cfg.to_toml();
+        if current != self.snapshot {
+            self.commit(current);
+        }
+        if let Some(prev) = self.undo.pop() {
+            let now = std::mem::replace(&mut self.snapshot, prev.clone());
+            self.redo.push(now);
+            self.restore(&prev);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            let now = std::mem::replace(&mut self.snapshot, next.clone());
+            self.undo.push(now);
+            self.restore(&next);
+        }
+    }
+
+    fn restore(&mut self, toml_text: &str) {
+        if let Ok(cfg) = toml::from_str::<Config>(toml_text) {
+            if !cfg.pages.contains_key(&self.page) {
+                self.page = cfg.home.clone();
+            }
+            self.cfg = cfg;
+            self.pending = None;
+        }
+    }
+
+    // --- key commands (shared by the context menu and the keyboard) ---
+
+    fn copy_key(&mut self, ctx: &egui::Context, pos: Pos) {
+        if let Some(k) = self.key_at(pos).cloned() {
+            if let Ok(json) = serde_json::to_string(&k) {
+                ctx.copy_text(json);
+            }
+            self.clip = Some(k);
+            self.set_status("Key copied.", false);
+        }
+    }
+
+    fn paste_key(&mut self, pos: Pos, from_clipboard: Option<&str>) {
+        let key = from_clipboard
+            .and_then(|s| serde_json::from_str::<Key>(s).ok())
+            .or_else(|| self.clip.clone());
+        let Some(mut key) = key else { return };
+        key.pos = pos;
+        let keys = self.cfg.pages.entry(self.page.clone()).or_default();
+        keys.retain(|k| k.pos != pos);
+        keys.push(key);
+        self.selected = Some(pos);
+        self.side_selected = false;
+    }
+
+    fn clear_key(&mut self, pos: Pos) {
+        if let Some(keys) = self.cfg.pages.get_mut(&self.page) {
+            keys.retain(|k| k.pos != pos);
+        }
+    }
+
+    fn test_action(&self, action: Action) {
+        let tx = self.test_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(actions::execute(&action));
+        });
+    }
+
+    /// Shortcuts that act on the window rather than a text field.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) && self.dirty()
+        {
+            self.save();
+        }
+        if self.dialog.is_some() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let redo = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y)
+                || i.consume_key(
+                    egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                    egui::Key::Z,
+                )
+        });
+        if redo {
+            self.redo();
+        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+            self.undo();
+        }
+        let Some(pos) = self.selected else {
+            if self.side_selected && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.side_selected = false;
+            }
+            return;
+        };
+        let (copy, cut, paste) = ctx.input(|i| {
+            let mut out = (false, false, None);
+            for e in &i.events {
+                match e {
+                    egui::Event::Copy => out.0 = true,
+                    egui::Event::Cut => out.1 = true,
+                    egui::Event::Paste(s) => out.2 = Some(s.clone()),
+                    _ => {}
+                }
+            }
+            out
+        });
+        if copy || cut {
+            self.copy_key(ctx, pos);
+        }
+        if cut {
+            self.clear_key(pos);
+        }
+        if let Some(s) = paste {
+            self.paste_key(pos, Some(&s));
+        }
+        ctx.input(|i| {
+            let mut p = pos;
+            if i.key_pressed(egui::Key::ArrowLeft) && p.col > 0 {
+                p.col -= 1;
+            }
+            if i.key_pressed(egui::Key::ArrowRight) && p.col + 1 < COLS {
+                p.col += 1;
+            }
+            if i.key_pressed(egui::Key::ArrowUp) && p.row > 0 {
+                p.row -= 1;
+            }
+            if i.key_pressed(egui::Key::ArrowDown) && p.row + 1 < ROWS {
+                p.row += 1;
+            }
+            self.selected = Some(p);
+            if i.key_pressed(egui::Key::Escape) {
+                self.selected = None;
+            }
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            self.clear_key(pos);
+        }
+    }
+
+    // --- layout ---
+
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.set_height(34.0);
+            ui.label(
+                RichText::new("opendock")
+                    .family(theme::semibold())
+                    .size(16.0)
+                    .color(theme::TEXT),
+            );
+            ui.add_space(14.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("☰", |ui| {
-                    if ui.button("Import from Stream Dock AJAZZ…").clicked() {
-                        self.dialog = Some(Dialog::Import);
-                        ui.close();
-                    }
-                    if ui.button("Reload from disk").clicked() {
-                        match Config::load(&self.path) {
-                            Ok(cfg) => {
-                                self.saved_toml = cfg.to_toml();
-                                self.page = cfg.home.clone();
-                                self.cfg = cfg;
-                                self.selected = None;
-                                self.set_status("Reloaded.", false);
-                            }
-                            Err(e) => self.set_status(e, true),
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Open config folder").clicked() {
-                        let dir = self.base_dir.to_string_lossy().into_owned();
-                        if let Err(e) = actions::execute(&Action::Run(Run::Path(dir))) {
-                            self.set_status(e, true);
-                        }
-                        ui.close();
-                    }
-                });
-                if ui.button("⚙ Settings").clicked() {
+                ui.menu_button("☰", |ui| self.main_menu(ui))
+                    .response
+                    .on_hover_text("More");
+                if ui
+                    .button("⚙ Settings")
+                    .on_hover_text("Start-up, sensors and deck settings")
+                    .clicked()
+                {
                     self.dialog = Some(Dialog::Settings);
                     self.check_lhm();
                 }
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("tabs")
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| ui.horizontal(|ui| self.page_tabs(ui)));
+                });
             });
         });
-        ui.add_space(4.0);
+    }
+
+    /// One tab per page; the home page comes first and carries a house.
+    fn page_tabs(&mut self, ui: &mut egui::Ui) {
+        for p in self.sorted_pages() {
+            let selected = p == self.page;
+            let home = p == self.cfg.home;
+            let text = if home { format!("🏠 {p}") } else { p.clone() };
+            let text = RichText::new(text).color(if selected {
+                theme::TEXT
+            } else {
+                theme::TEXT_WEAK
+            });
+            let text = if selected {
+                text.family(theme::semibold())
+            } else {
+                text
+            };
+            let resp = ui.add(
+                egui::Button::new(text)
+                    .frame_when_inactive(false)
+                    .min_size(Vec2::new(0.0, 28.0)),
+            );
+            if selected {
+                let r = resp.rect;
+                ui.painter().rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(r.left() + 8.0, r.bottom() + 1.0),
+                        Pos2::new(r.right() - 8.0, r.bottom() + 3.0),
+                    ),
+                    1.0,
+                    ACCENT,
+                );
+            }
+            let resp = resp.on_hover_text(if home {
+                "Home page, shown when the deck starts. Double-click to rename, right-click for more."
+            } else {
+                "Double-click to rename, right-click for more."
+            });
+            if resp.clicked() && !selected {
+                self.page = p.clone();
+                self.selected = None;
+            }
+            if resp.double_clicked() {
+                self.page = p.clone();
+                self.dialog = Some(Dialog::RenamePage(p.clone()));
+            }
+            resp.context_menu(|ui| {
+                self.page = p.clone();
+                self.page_menu(ui);
+            });
+        }
+        if theme::icon_button(ui, true, "➕", "New page").clicked() {
+            self.dialog = Some(Dialog::NewPage(String::new()));
+        }
+    }
+
+    /// Commands for the current page (tab context menu and the ☰ menu).
+    fn page_menu(&mut self, ui: &mut egui::Ui) {
+        let not_home = self.page != self.cfg.home;
+        if ui.button("Rename page…").clicked() {
+            self.dialog = Some(Dialog::RenamePage(self.page.clone()));
+            ui.close();
+        }
+        if ui
+            .add_enabled(not_home, egui::Button::new("Make home page"))
+            .on_hover_text("The page shown when the deck starts")
+            .clicked()
+        {
+            self.cfg.home = self.page.clone();
+            ui.close();
+        }
+        if ui
+            .add_enabled(not_home, egui::Button::new("Delete page…"))
+            .on_disabled_hover_text("The home page cannot be deleted")
+            .clicked()
+        {
+            self.dialog = Some(Dialog::DeletePage);
+            ui.close();
+        }
+    }
+
+    fn main_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(220.0);
+        if ui.button("New page…").clicked() {
+            self.dialog = Some(Dialog::NewPage(String::new()));
+            ui.close();
+        }
+        self.page_menu(ui);
+        ui.separator();
+        if ui
+            .add_enabled(
+                self.can_undo(),
+                egui::Button::new("Undo").shortcut_text("Ctrl+Z"),
+            )
+            .clicked()
+        {
+            self.undo();
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                !self.redo.is_empty(),
+                egui::Button::new("Redo").shortcut_text("Ctrl+Y"),
+            )
+            .clicked()
+        {
+            self.redo();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Import from Stream Dock AJAZZ…").clicked() {
+            self.dialog = Some(Dialog::Import);
+            ui.close();
+        }
+        if ui.button("Reload from disk").clicked() {
+            match Config::load(&self.path) {
+                Ok(cfg) => {
+                    self.saved_toml = cfg.to_toml();
+                    self.page = cfg.home.clone();
+                    self.cfg = cfg;
+                    self.selected = None;
+                    self.set_status("Reloaded.", false);
+                }
+                Err(e) => self.set_status(e, true),
+            }
+            ui.close();
+        }
+        if ui.button("Open config folder").clicked() {
+            let dir = self.base_dir.to_string_lossy().into_owned();
+            if let Err(e) = actions::execute(&Action::Run(Run::Path(dir))) {
+                self.set_status(e, true);
+            }
+            ui.close();
+        }
     }
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
         ui.horizontal(|ui| {
+            ui.set_height(34.0);
             status_dot(
                 ui,
                 if self.engine_running {
                     OK
                 } else {
-                    Color32::GRAY
+                    theme::TEXT_FAINT
                 },
             );
             if self.engine_running {
-                ui.label("Engine running");
+                ui.label("Deck running");
                 if ui
                     .button("Stop")
-                    .on_hover_text("Stop driving the deck")
+                    .on_hover_text("Stop driving the deck (the tray icon goes away)")
                     .clicked()
                 {
                     instance::request_quit();
                     self.engine_checked = Instant::now() - Duration::from_millis(500);
                 }
             } else {
-                ui.label("Engine stopped");
+                ui.label(RichText::new("Deck stopped").color(theme::TEXT_WEAK));
                 if ui
-                    .button("Start")
-                    .on_hover_text("Start driving the deck")
+                    .add(theme::primary("Start"))
+                    .on_hover_text("Start driving the deck (saves first)")
                     .clicked()
                 {
                     self.start_engine();
                 }
             }
-            ui.separator();
             if let Some(s) = &self.status {
-                ui.colored_label(
-                    if s.error {
-                        ERR
-                    } else {
-                        ui.visuals().text_color()
-                    },
-                    &s.text,
-                );
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                let (icon, color) = if s.error {
+                    ("⚠", ERR)
+                } else {
+                    ("✔", theme::TEXT_WEAK)
+                };
+                ui.label(RichText::new(format!("{icon}  {}", s.text)).color(color));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let dirty = self.dirty();
-                let save = egui::Button::new(RichText::new("💾 Save").strong());
+                let save = if dirty {
+                    theme::primary("Save")
+                } else {
+                    egui::Button::new("Saved")
+                };
                 if ui
                     .add_enabled(dirty, save)
                     .on_hover_text("Ctrl+S")
@@ -642,20 +927,26 @@ impl SettingsApp {
                 {
                     self.save();
                 }
-                if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
-                    if let Ok(cfg) = toml::from_str::<Config>(&self.saved_toml) {
-                        if !cfg.pages.contains_key(&self.page) {
-                            self.page = cfg.home.clone();
-                        }
-                        self.cfg = cfg;
-                    }
-                }
                 if dirty {
-                    ui.colored_label(Color32::from_rgb(240, 190, 80), "Unsaved changes");
+                    if ui
+                        .button("Revert")
+                        .on_hover_text("Discard every change since the last save")
+                        .clicked()
+                    {
+                        let saved = self.saved_toml.clone();
+                        self.restore(&saved);
+                    }
+                    ui.label(RichText::new("● Unsaved changes").color(WARN));
+                }
+                ui.add_space(6.0);
+                if theme::icon_button(ui, !self.redo.is_empty(), "⟳", "Redo (Ctrl+Y)").clicked() {
+                    self.redo();
+                }
+                if theme::icon_button(ui, self.can_undo(), "⟲", "Undo (Ctrl+Z)").clicked() {
+                    self.undo();
                 }
             });
         });
-        ui.add_space(4.0);
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui) {
@@ -668,11 +959,7 @@ impl SettingsApp {
             return;
         }
         let Some(pos) = self.selected else {
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                ui.weak("Select a key to edit it.");
-                ui.weak("Drag keys to move or swap them.");
-            });
+            empty_inspector(ui);
             return;
         };
         let pages = self.sorted_pages();
@@ -703,10 +990,7 @@ impl SettingsApp {
                 }
             });
         if let Some(action) = req.test {
-            let tx = self.test_tx.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(actions::execute(&action));
-            });
+            self.test_action(action);
         }
         if req.refresh_audio {
             self.refresh_audio();
@@ -737,11 +1021,12 @@ impl SettingsApp {
         let grid_rect = Rect::from_min_size(origin, total);
         ui.allocate_rect(avail, Sense::hover());
         let painter = ui.painter().clone();
-        painter.rect_filled(grid_rect.expand(22.0), 16.0, Color32::from_gray(24));
+        // The deck's body.
+        painter.rect_filled(grid_rect.expand(22.0), 18.0, Color32::from_rgb(8, 8, 10));
         painter.rect_stroke(
             grid_rect.expand(22.0),
-            16.0,
-            Stroke::new(1.0, Color32::from_gray(60)),
+            18.0,
+            Stroke::new(1.0, theme::BORDER),
             StrokeKind::Inside,
         );
 
@@ -761,20 +1046,33 @@ impl SettingsApp {
             origin + Vec2::new(keys_w + 2.0 * gap, 0.0),
             Vec2::new(side_w, keys_h),
         );
-        let side_resp = ui.interact(side_rect, Id::new("side"), Sense::click());
+        let side_resp = ui
+            .interact(side_rect, Id::new("side"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         let tex = self.side_texture(&ctx);
         painter.add(
             egui::epaint::RectShape::filled(side_rect, 8.0, Color32::WHITE)
                 .with_texture(tex.id(), FULL_UV),
         );
-        let stroke = if self.side_selected {
-            Stroke::new(3.0, ACCENT)
-        } else if side_resp.hovered() {
-            Stroke::new(1.5, Color32::from_gray(140))
-        } else {
-            Stroke::new(1.0, Color32::from_gray(55))
-        };
-        painter.rect_stroke(side_rect, 8.0, stroke, StrokeKind::Outside);
+        if self.cfg.side.widgets.is_empty() {
+            painter.text(
+                side_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "+",
+                egui::FontId::proportional(24.0),
+                if side_resp.hovered() {
+                    theme::TEXT_WEAK
+                } else {
+                    Color32::from_gray(60)
+                },
+            );
+        }
+        painter.rect_stroke(
+            side_rect,
+            8.0,
+            self.outline(self.side_selected, side_resp.hovered(), false),
+            StrokeKind::Outside,
+        );
         if side_resp
             .on_hover_text("Small screen: click to choose what it shows")
             .clicked()
@@ -783,11 +1081,14 @@ impl SettingsApp {
             self.selected = None;
         }
 
+        let mut menu_cmd = None;
         for row in 0..ROWS {
             for col in 0..COLS {
                 let pos = Pos { row, col };
                 let rect = rect_of(pos);
-                let resp = ui.interact(rect, Id::new(("key", row, col)), Sense::click_and_drag());
+                let resp = ui
+                    .interact(rect, Id::new(("key", row, col)), Sense::click_and_drag())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                 let key = self.key_at(pos).cloned();
                 let being_dragged = self.drag_from == Some(pos);
                 match &key {
@@ -807,38 +1108,62 @@ impl SettingsApp {
                         }
                     }
                     None => {
-                        painter.rect_filled(rect, 10.0, Color32::from_gray(38));
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "+",
-                            egui::FontId::proportional(26.0),
-                            Color32::from_gray(80),
-                        );
+                        painter.rect_filled(rect, 10.0, Color32::from_rgb(24, 25, 29));
+                        if resp.hovered() || self.selected == Some(pos) {
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "+",
+                                egui::FontId::proportional(26.0),
+                                theme::TEXT_FAINT,
+                            );
+                        }
                     }
                 }
                 let drop_target = self.drag_from.is_some_and(|f| f != pos)
                     && pointer.is_some_and(|p| rect.contains(p));
-                let stroke = if drop_target {
-                    Stroke::new(3.0, Color32::from_rgb(240, 190, 80))
-                } else if self.selected == Some(pos) {
-                    Stroke::new(3.0, ACCENT)
-                } else if resp.hovered() {
-                    Stroke::new(1.5, Color32::from_gray(140))
-                } else {
-                    Stroke::new(1.0, Color32::from_gray(55))
-                };
-                painter.rect_stroke(rect, 10.0, stroke, StrokeKind::Outside);
+                painter.rect_stroke(
+                    rect,
+                    10.0,
+                    self.outline(self.selected == Some(pos), resp.hovered(), drop_target),
+                    StrokeKind::Outside,
+                );
 
                 if resp.drag_started() && key.is_some() {
                     self.drag_from = Some(pos);
                     self.selected = Some(pos);
                     self.side_selected = false;
                 }
-                if resp.clicked() {
+                if resp.clicked() || resp.secondary_clicked() {
                     self.selected = Some(pos);
                     self.side_selected = false;
                 }
+                let resp = match key.as_ref().and_then(|k| k.action.as_ref()) {
+                    Some(a) if self.drag_from.is_none() => resp.on_hover_text(editor::describe(a)),
+                    _ => resp,
+                };
+                let can_paste = self.clip.is_some();
+                resp.context_menu(|ui| {
+                    if let Some(cmd) = key_menu(ui, key.as_ref(), can_paste) {
+                        menu_cmd = Some((pos, cmd));
+                    }
+                });
+            }
+        }
+        if let Some((pos, cmd)) = menu_cmd {
+            match cmd {
+                KeyCmd::Test => {
+                    if let Some(a) = self.key_at(pos).and_then(|k| k.action.clone()) {
+                        self.test_action(a);
+                    }
+                }
+                KeyCmd::Copy => self.copy_key(&ctx, pos),
+                KeyCmd::Cut => {
+                    self.copy_key(&ctx, pos);
+                    self.clear_key(pos);
+                }
+                KeyCmd::Paste => self.paste_key(pos, None),
+                KeyCmd::Clear => self.clear_key(pos),
             }
         }
 
@@ -865,12 +1190,25 @@ impl SettingsApp {
         }
 
         painter.text(
-            Pos2::new(grid_rect.center().x, grid_rect.bottom() + 44.0),
+            Pos2::new(grid_rect.center().x, grid_rect.bottom() + 48.0),
             egui::Align2::CENTER_CENTER,
-            "Click a key or the small screen to edit it · drag keys to move or swap · save to update the deck",
-            egui::FontId::proportional(13.0),
-            Color32::from_gray(120),
+            "Click to edit  ·  drag to move  ·  right-click for more",
+            egui::FontId::proportional(12.5),
+            theme::TEXT_FAINT,
         );
+    }
+
+    /// Outline of a key or the small screen.
+    fn outline(&self, selected: bool, hovered: bool, drop_target: bool) -> Stroke {
+        if drop_target {
+            Stroke::new(2.5, WARN)
+        } else if selected {
+            Stroke::new(2.5, ACCENT)
+        } else if hovered {
+            Stroke::new(1.5, Color32::from_gray(130))
+        } else {
+            Stroke::new(1.0, Color32::from_gray(48))
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -879,15 +1217,18 @@ impl SettingsApp {
         };
         let mut keep = true;
         let creating = matches!(dialog, Dialog::NewPage(_));
-        let modal = egui::Modal::new(Id::new("dialog")).show(ctx, |ui| {
-            ui.set_width(380.0);
+        let wide = matches!(dialog, Dialog::Settings);
+        let modal = egui::Modal::new(Id::new("dialog"))
+            .backdrop_color(Color32::from_black_alpha(150))
+            .show(ctx, |ui| {
+            ui.set_width(if wide { 460.0 } else { 360.0 });
             match &mut dialog {
                 Dialog::Settings => {
-                    ui.heading("⚙ Settings");
-                    ui.add_space(8.0);
+                    ui.heading("Settings");
+                    ui.add_space(10.0);
 
-                    ui.label(RichText::new("General").strong());
-                    ui.indent("general", |ui| {
+                    theme::section(ui, "General");
+                    theme::card(ui, |ui| {
                         if ui
                             .checkbox(&mut self.start_with_windows, "Start opendock with Windows")
                             .changed()
@@ -897,24 +1238,24 @@ impl SettingsApp {
                                 self.set_status(e, true);
                             }
                         }
-                        ui.weak("Runs the engine and its tray icon when you sign in. Applies right away.");
+                        theme::hint(ui, "Runs the deck and its tray icon when you sign in. Applies right away.");
                     });
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
 
-                    ui.label(RichText::new("Sensors").strong());
-                    ui.indent("sensors", |ui| self.sensors_settings(ui));
-                    ui.add_space(10.0);
+                    theme::section(ui, "Sensors");
+                    theme::card(ui, |ui| self.sensors_settings(ui));
+                    ui.add_space(12.0);
 
-                    ui.label(RichText::new("Deck").strong());
-                    ui.indent("deck", |ui| {
-                        egui::Grid::new("deck_settings").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    theme::section(ui, "Deck");
+                    theme::card(ui, |ui| {
+                        egui::Grid::new("deck_settings").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                             ui.label("Brightness");
                             ui.add(egui::Slider::new(&mut self.cfg.brightness, 0..=100).suffix(" %"));
                             ui.end_row();
 
                             ui.label("Title font");
                             ui.horizontal(|ui| {
-                                let name = self.cfg.font.as_ref().map_or("Segoe UI Bold (default)".to_string(), |f| {
+                                let name = self.cfg.font.as_ref().map_or("Segoe UI Bold".to_string(), |f| {
                                     f.file_name().map_or(f.display().to_string(), |n| n.to_string_lossy().into_owned())
                                 });
                                 ui.label(name);
@@ -929,23 +1270,29 @@ impl SettingsApp {
                                         self.cfg.font = Some(rel);
                                     }
                                 }
-                                if self.cfg.font.is_some() && ui.button("Default").clicked() {
+                                if self.cfg.font.is_some() && ui.button("Reset").clicked() {
                                     self.cfg.font = None;
                                 }
                             });
                             ui.end_row();
                         });
-                        ui.weak("Deck settings are saved with your keys (Save / Ctrl+S).");
+                        theme::hint(ui, "Deck settings are saved with your keys (Save / Ctrl+S).");
                     });
-                    ui.add_space(10.0);
-                    ui.separator();
-                    if ui.button("Close").clicked() {
-                        keep = false;
-                    }
+                    ui.add_space(14.0);
+                    buttons(ui, |ui| {
+                        if ui.add(theme::primary("Done")).clicked() {
+                            keep = false;
+                        }
+                    });
                 }
                 Dialog::NewPage(name) | Dialog::RenamePage(name) => {
                     ui.heading(if creating { "New page" } else { "Rename page" });
-                    let edit = ui.add(egui::TextEdit::singleline(name).hint_text("Page name"));
+                    ui.add_space(8.0);
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Page name")
+                            .desired_width(f32::INFINITY),
+                    );
                     edit.request_focus();
                     let name = name.trim().to_string();
                     let taken = self.cfg.pages.contains_key(&name) && (creating || name != self.page);
@@ -953,10 +1300,16 @@ impl SettingsApp {
                         ui.colored_label(ERR, "A page with that name already exists.");
                     }
                     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    buttons(ui, |ui| {
                         let ok = !name.is_empty() && !taken;
-                        let go = ui.add_enabled(ok, egui::Button::new(if creating { "Create" } else { "Rename" })).clicked()
+                        let go = ui
+                            .add_enabled(ok, theme::primary(if creating { "Create" } else { "Rename" }))
+                            .clicked()
                             || (ok && enter);
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
                         if go {
                             if creating {
                                 self.cfg.pages.insert(name.clone(), Vec::new());
@@ -968,19 +1321,19 @@ impl SettingsApp {
                             self.selected = None;
                             keep = false;
                         }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
-                        }
                     });
                 }
                 Dialog::DeletePage => {
                     ui.heading("Delete page");
+                    ui.add_space(8.0);
                     let linked = pages_linking_to(&self.cfg, &self.page);
                     if linked.is_empty() {
                         let n = self.cfg.pages.get(&self.page).map_or(0, Vec::len);
-                        ui.label(format!("Delete page \"{}\" and its {n} keys?", self.page));
-                        ui.horizontal(|ui| {
-                            if ui.button(RichText::new("Delete").color(ERR)).clicked() {
+                        ui.label(format!("Delete \"{}\" and its {n} keys?", self.page));
+                        theme::hint(ui, "You can undo this with Ctrl+Z until you close the window.");
+                        ui.add_space(8.0);
+                        buttons(ui, |ui| {
+                            if ui.add(theme::danger("Delete")).clicked() {
                                 self.cfg.pages.remove(&self.page);
                                 self.page = self.cfg.home.clone();
                                 self.selected = None;
@@ -995,19 +1348,22 @@ impl SettingsApp {
                             "Keys on {} still open this page. Change those keys first.",
                             linked.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(", ")
                         ));
-                        if ui.button("OK").clicked() {
-                            keep = false;
-                        }
+                        ui.add_space(8.0);
+                        buttons(ui, |ui| {
+                            if ui.add(theme::primary("OK")).clicked() {
+                                keep = false;
+                            }
+                        });
                     }
                 }
                 Dialog::Import => {
                     ui.heading("Import from Stream Dock AJAZZ");
-                    ui.label(
-                        "Replace the current setup with the profile active in the vendor app? \
-                         Icons are copied into the config folder. Nothing is saved until you click Save.",
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Import").clicked() {
+                    ui.add_space(8.0);
+                    ui.label("Replace the current setup with the profile that is active in the vendor app?");
+                    theme::hint(ui, "Icons are copied into the config folder. Nothing is saved until you click Save, and Ctrl+Z undoes it.");
+                    ui.add_space(8.0);
+                    buttons(ui, |ui| {
+                        if ui.add(theme::primary("Import")).clicked() {
                             keep = false;
                             match import::active_profile().and_then(|p| import::import(&p, &self.base_dir)) {
                                 Ok(report) => {
@@ -1029,24 +1385,30 @@ impl SettingsApp {
                 }
                 Dialog::ImportNotes(notes) => {
                     ui.heading("Imported with notes");
+                    ui.add_space(8.0);
                     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                         for n in notes.iter() {
                             ui.label(format!("• {n}"));
                         }
                     });
-                    if ui.button("OK").clicked() {
-                        keep = false;
-                    }
+                    ui.add_space(8.0);
+                    buttons(ui, |ui| {
+                        if ui.add(theme::primary("OK")).clicked() {
+                            keep = false;
+                        }
+                    });
                 }
                 Dialog::Unsaved => {
                     ui.heading("Unsaved changes");
+                    ui.add_space(8.0);
                     ui.label("Save your changes before closing?");
-                    ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    buttons(ui, |ui| {
                         let mut close = false;
-                        if ui.button(RichText::new("Save and close").strong()).clicked() && self.save() {
+                        if ui.add(theme::primary("Save")).clicked() && self.save() {
                             close = true;
                         }
-                        if ui.button("Discard").clicked() {
+                        if ui.button("Don't save").clicked() {
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {
@@ -1071,22 +1433,104 @@ impl SettingsApp {
     }
 }
 
+/// A row of dialog buttons, right-aligned; add the primary one first.
+fn buttons(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add);
+}
+
+#[derive(Clone, Copy)]
+enum KeyCmd {
+    Test,
+    Copy,
+    Cut,
+    Paste,
+    Clear,
+}
+
+/// Right-click menu of a key.
+fn key_menu(ui: &mut egui::Ui, key: Option<&Key>, can_paste: bool) -> Option<KeyCmd> {
+    let mut cmd = None;
+    let has_action = key.is_some_and(|k| k.action.is_some());
+    let mut item = |ui: &mut egui::Ui, enabled: bool, text: &str, short: &str, c: KeyCmd| {
+        if ui
+            .add_enabled(enabled, egui::Button::new(text).shortcut_text(short))
+            .clicked()
+        {
+            cmd = Some(c);
+            ui.close();
+        }
+    };
+    ui.set_min_width(180.0);
+    item(ui, has_action, "Test action", "", KeyCmd::Test);
+    ui.separator();
+    item(ui, key.is_some(), "Copy", "Ctrl+C", KeyCmd::Copy);
+    item(ui, key.is_some(), "Cut", "Ctrl+X", KeyCmd::Cut);
+    item(ui, can_paste, "Paste", "Ctrl+V", KeyCmd::Paste);
+    ui.separator();
+    item(ui, key.is_some(), "Clear", "Del", KeyCmd::Clear);
+    cmd
+}
+
+/// What the inspector shows when nothing is selected.
+fn empty_inspector(ui: &mut egui::Ui) {
+    ui.add_space(28.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            RichText::new("Nothing selected")
+                .family(theme::semibold())
+                .size(15.0),
+        );
+        ui.add_space(4.0);
+        theme::hint(ui, "Click a key or the small screen to edit it.");
+    });
+    ui.add_space(24.0);
+    theme::section(ui, "Shortcuts");
+    egui::Grid::new("shortcuts")
+        .num_columns(2)
+        .spacing([16.0, 6.0])
+        .show(ui, |ui| {
+            for (keys, what) in [
+                ("Arrows", "Move the selection"),
+                ("Ctrl+C / X / V", "Copy, cut, paste a key"),
+                ("Del", "Clear the key"),
+                ("Ctrl+Z / Y", "Undo, redo"),
+                ("Ctrl+S", "Save"),
+                ("Esc", "Deselect"),
+            ] {
+                ui.label(RichText::new(keys).color(theme::TEXT));
+                ui.label(RichText::new(what).color(theme::TEXT_WEAK));
+                ui.end_row();
+            }
+        });
+}
+
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_close(&ctx);
         self.poll(&ctx);
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) && self.dirty() {
-            self.save();
-        }
-        egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("bottom").show(ui, |ui| self.bottom_bar(ui));
+        self.shortcuts(&ctx);
+        self.track_history(&ctx);
+        let bar = |m: (i8, i8)| {
+            egui::Frame::new()
+                .fill(theme::PANEL)
+                .inner_margin(egui::Margin::symmetric(m.0, m.1))
+        };
+        egui::Panel::top("top")
+            .frame(bar((14, 4)))
+            .show(ui, |ui| self.top_bar(ui));
+        egui::Panel::bottom("bottom")
+            .frame(bar((14, 4)))
+            .show(ui, |ui| self.bottom_bar(ui));
         egui::Panel::right("inspector")
+            .frame(bar((18, 14)))
             .resizable(true)
             .default_size(400.0)
             .size_range(340.0..=560.0)
             .show(ui, |ui| self.inspector(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.grid(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .show(ui, |ui| self.grid(ui));
         self.dialogs(&ctx);
     }
 }
